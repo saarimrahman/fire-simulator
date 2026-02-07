@@ -4,6 +4,13 @@ A Monte Carlo simulator for **FIRE** (Financial Independence, Retire Early). Mod
 
 ---
 
+## Live app
+
+**[fire-monte-carlo-sim.streamlit.app](https://fire-monte-carlo-sim.streamlit.app/)**
+
+---
+
+
 ## What it does
 
 - **Runs thousands of simulations** with random market returns, job changes, and health shocks
@@ -15,6 +22,23 @@ A Monte Carlo simulator for **FIRE** (Financial Independence, Retire Early). Mod
 You get **FIRE probability by age**, **net worth fan charts**, **cash flow Sankey diagrams**, and a **minimum income table** for “90% chance to FIRE by age X” by city.
 
 ---
+
+## Dashboard at a glance
+
+- **Net Worth Fan** — Percentile bands (P5–P95, P10–P90, P25–P75) and median over time; hover for dollar ranges
+- **Cash Flow Sankey** — Where money goes (income → taxes, spending, savings) by life stage
+- **Spending Deep Dive** — Housing, discretionary, kids, healthcare, education, one-time over time
+- **Account Composition** — Taxable, 401(k), Roth, HSA, home equity over time
+- **Income vs Spending** — Household income and total spending (and the gap = savings)
+- **FIRE Histogram** — Distribution of ages at which you hit FIRE
+- **Outcome Distributions** — Ending net worth, net worth at FIRE, spending at FIRE, years to FIRE
+- **FIRE Probability** — CDF: “% FIRE’d by this age” (with vs without starting savings)
+- **Sensitivity** — How ±20% in income/seed/spouse pay changes median FIRE age
+- **Minimum TC table** — “What income do I need for 90% chance to FIRE by 40/42/…/55?” by city
+- **City editor** — Add or edit cities (rent, home price, taxes, etc.)
+
+---
+
 
 ## Quick start
 
@@ -44,32 +68,10 @@ Then open the URL in your browser (usually `http://localhost:8501`).
 
 ---
 
-## Dashboard at a glance
-
-- **Net Worth Fan** — Percentile bands (P5–P95, P10–P90, P25–P75) and median over time; hover for dollar ranges
-- **Cash Flow Sankey** — Where money goes (income → taxes, spending, savings) by life stage
-- **Spending Deep Dive** — Housing, discretionary, kids, healthcare, education, one-time over time
-- **Account Composition** — Taxable, 401(k), Roth, HSA, home equity over time
-- **Income vs Spending** — Household income and total spending (and the gap = savings)
-- **FIRE Histogram** — Distribution of ages at which you hit FIRE
-- **Outcome Distributions** — Ending net worth, net worth at FIRE, spending at FIRE, years to FIRE
-- **FIRE Probability** — CDF: “% FIRE’d by this age” (with vs without starting savings)
-- **Sensitivity** — How ±20% in income/seed/spouse pay changes median FIRE age
-- **Minimum TC table** — “What income do I need for 90% chance to FIRE by 40/42/…/55?” by city
-- **City editor** — Add or edit cities (rent, home price, taxes, etc.)
-
----
-
 ## Requirements
 
 - Python 3.x
 - `numpy`, `streamlit`, `plotly`, `tabulate` (see `requirements.txt` for versions)
-
----
-
-## Live app
-
-**[fire-monte-carlo-sim.streamlit.app](https://fire-monte-carlo-sim.streamlit.app/)**
 
 ---
 
