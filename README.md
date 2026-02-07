@@ -2,13 +2,9 @@
 
 A Monte Carlo simulator for **FIRE** (Financial Independence, Retire Early). Model your income, savings, housing, family, and market randomness to see when you could reach financial independence—and how likely you are to get there.
 
----
-
 ## Live app
 
 **[fire-monte-carlo-sim.streamlit.app](https://fire-monte-carlo-sim.streamlit.app/)**
-
----
 
 
 ## What it does
@@ -21,7 +17,6 @@ A Monte Carlo simulator for **FIRE** (Financial Independence, Retire Early). Mod
 
 You get **FIRE probability by age**, **net worth fan charts**, **cash flow Sankey diagrams**, and a **minimum income table** for “90% chance to FIRE by age X” by city.
 
----
 
 ## Dashboard at a glance
 
