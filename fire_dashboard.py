@@ -1053,6 +1053,13 @@ with tab9:
 st.markdown("---")
 st.subheader("Minimum TC for 90% FIRE Confidence")
 
+# Option to use baseline or personalized settings
+table_mode = st.radio(
+    "Table Mode",
+    ["Baseline (Static)", "Your Settings (Dynamic)"],
+    help="Baseline shows standard scenario ($0 seed, 2 kids). Your Settings uses your current configuration."
+)
+
 @st.cache_data
 def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
                          marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
@@ -1073,14 +1080,43 @@ def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
         data.append(row)
     return data
 
-with st.spinner("Computing minimum TC table..."):
-    min_tc_data = compute_min_tc_table(
-        seed_taxable, seed_401k, seed_roth, seed_hsa,
-        marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-        tuple(all_cities.keys())  # Convert to tuple for caching
-    )
+if table_mode == "Baseline (Static)":
+    # Use fixed baseline parameters
+    baseline_seed_taxable, baseline_seed_401k, baseline_seed_roth, baseline_seed_hsa = 0, 0, 0, 0
+    baseline_marriage_age = 29
+    baseline_kid_ages = (31, 33)
+    baseline_spouse_works = True
+    baseline_spouse_salary = 80000
+    baseline_part_time_fraction = 0.5
+    
+    with st.spinner("Computing baseline minimum TC table..."):
+        min_tc_data = compute_min_tc_table(
+            baseline_seed_taxable, baseline_seed_401k, baseline_seed_roth, baseline_seed_hsa,
+            baseline_marriage_age, baseline_kid_ages, baseline_spouse_works, 
+            baseline_spouse_salary, baseline_part_time_fraction,
+            tuple(all_cities.keys())
+        )
+    st.caption("Baseline: $0 starting seed, married at 29, 2 kids (ages 31, 33), spouse works ($80K, 50% part-time after kids)")
+else:
+    # Use current user settings
+    if st.button("Calculate with Your Settings", type="primary"):
+        with st.spinner("Computing personalized minimum TC table..."):
+            min_tc_data = compute_min_tc_table(
+                seed_taxable, seed_401k, seed_roth, seed_hsa,
+                marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
+                tuple(all_cities.keys())
+            )
+            st.session_state.personalized_table = min_tc_data
+    
+    if 'personalized_table' in st.session_state:
+        min_tc_data = st.session_state.personalized_table
+        st.caption(f"Using your settings: ${seed_total:,.0f} seed, {len(kid_ages)} kids, spouse {'works' if spouse_works else 'stays home'}")
+    else:
+        st.info("Click 'Calculate with Your Settings' to see how your configuration affects minimum TC requirements.")
+        min_tc_data = None
 
-st.dataframe(min_tc_data, use_container_width=True, hide_index=True)
+if min_tc_data:
+    st.dataframe(min_tc_data, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # CITY CONFIGURATION EDITOR
