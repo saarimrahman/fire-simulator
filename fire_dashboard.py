@@ -208,13 +208,37 @@ with tab1:
 
     fig = go.Figure()
 
+    # Add invisible traces for ranges to show in hover
+    fig.add_trace(go.Scatter(
+        x=ages, y=(p5 + p95) / 2, mode='lines',
+        line=dict(width=0), showlegend=False,
+        customdata=np.column_stack([p5, p95]),
+        hovertemplate='P5-P95: $%{customdata[0]:,.0f} - $%{customdata[1]:,.0f}<extra></extra>',
+        name='P5-P95'
+    ))
+    fig.add_trace(go.Scatter(
+        x=ages, y=(p10 + p90) / 2, mode='lines',
+        line=dict(width=0), showlegend=False,
+        customdata=np.column_stack([p10, p90]),
+        hovertemplate='P10-P90: $%{customdata[0]:,.0f} - $%{customdata[1]:,.0f}<extra></extra>',
+        name='P10-P90'
+    ))
+    fig.add_trace(go.Scatter(
+        x=ages, y=(p25 + p75) / 2, mode='lines',
+        line=dict(width=0), showlegend=False,
+        customdata=np.column_stack([p25, p75]),
+        hovertemplate='P25-P75: $%{customdata[0]:,.0f} - $%{customdata[1]:,.0f}<extra></extra>',
+        name='P25-P75'
+    ))
+
     # 5-95 band
     fig.add_trace(go.Scatter(
         x=np.concatenate([ages, ages[::-1]]),
         y=np.concatenate([p95, p5[::-1]]),
         fill='toself', fillcolor='rgba(99, 110, 250, 0.1)',
         line=dict(color='rgba(255,255,255,0)'),
-        name='P5-P95', showlegend=True
+        name='P5-P95', showlegend=True,
+        hoverinfo='skip'
     ))
 
     # 10-90 band
@@ -223,7 +247,8 @@ with tab1:
         y=np.concatenate([p90, p10[::-1]]),
         fill='toself', fillcolor='rgba(99, 110, 250, 0.2)',
         line=dict(color='rgba(255,255,255,0)'),
-        name='P10-P90', showlegend=True
+        name='P10-P90', showlegend=True,
+        hoverinfo='skip'
     ))
 
     # 25-75 band
@@ -232,14 +257,16 @@ with tab1:
         y=np.concatenate([p75, p25[::-1]]),
         fill='toself', fillcolor='rgba(99, 110, 250, 0.3)',
         line=dict(color='rgba(255,255,255,0)'),
-        name='P25-P75', showlegend=True
+        name='P25-P75', showlegend=True,
+        hoverinfo='skip'
     ))
 
     # Median line
     fig.add_trace(go.Scatter(
         x=ages, y=median,
         mode='lines', line=dict(color='#636EFA', width=3),
-        name='Median'
+        name='Median',
+        hovertemplate='Median: $%{y:,.0f}<extra></extra>'
     ))
 
     # Mark median FIRE age
