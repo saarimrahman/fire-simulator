@@ -416,7 +416,6 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         current_age = CURRENT_AGE
     n_years = life_expectancy - current_age + 1
     N = n_sims; cfg = CITIES[city_name]
-    infl = (1 + INFLATION) ** np.arange(n_years)
 
     # Initialize trajectory arrays if needed
     if return_trajectories:
@@ -476,6 +475,36 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     jl_roll = rng.random(size=(n_years, N))
     jl_thresh = np.where(recession, 0.15, 0.03)
     hs_roll = rng.random(size=(n_years, N))
+
+    # Stochastic inflation: two-component model.
+    #
+    # Component 1 — persistent AR(1) trend (the "sticky" part of inflation):
+    #   core[t] = rho*core[t-1] + (1-rho)*mu + eps[t]
+    #   Unconditional mean = mu = 3%.  Captures multi-year inflation cycles.
+    #
+    # Component 2 — transient stagflation shock (observation-layer only, does NOT feed
+    #   back into the persistent state):
+    #   inf_rates[t] = core[t] + recession[t] * stag[t]
+    #   E[inf_rates] = 3% + P(rec)*E[stag] ≈ 3% + 0.15*4% = 3.6% — historically realistic.
+    #
+    # Separating the two components prevents the AR(1) from permanently amplifying recession
+    # shocks (which would push the unconditional mean to ~7% otherwise).
+    _mu_inf    = 0.030   # long-run core mean (3%)
+    _rho_inf   = 0.85    # persistence of the trend component
+    _sigma_inf = 0.015   # idiosyncratic annual shock volatility
+    _eps_inf     = rng.normal(0, _sigma_inf, size=(n_years, N))
+    _stagflation = rng.uniform(0.02, 0.06, size=(n_years, N))  # transient spike during recessions
+
+    _inf_core = np.empty((n_years, N))
+    _inf_core[0] = _mu_inf
+    for _t in range(1, n_years):
+        _inf_core[_t] = _rho_inf * _inf_core[_t - 1] + (1 - _rho_inf) * _mu_inf + _eps_inf[_t]
+
+    # Observed inflation = persistent trend + transient stagflation overlay
+    inf_rates = _inf_core + recession * _stagflation
+    inf_rates = np.clip(inf_rates, -0.005, 0.15)   # allow mild deflation, cap at 15%
+    # Cumulative multipliers shape (n_years, N): infl[t, sim] = product of (1+inf_rate) up to year t
+    infl = np.cumprod(1 + inf_rates, axis=0)
 
     # Generate stochastic income trajectories using new career model
     incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config, current_age=current_age)
@@ -615,9 +644,11 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         total_port = taxable + t401k + roth + hsa_bal
         ret_base_spend = np.where(fired & (ret_base_spend==0), total_spend, ret_base_spend)
         wd_rate = np.where(fired & (total_port > 0), ret_base_spend/total_port, 0)
-        # Use fire_swr (SWR at retirement) for withdrawal rate bounds instead of hardcoded values
+        # Use fire_swr (SWR at retirement) for withdrawal rate bounds instead of hardcoded values.
+        # Normal case uses actual stochastic inflation for this year/sim so high-inflation years
+        # correctly force higher spending growth (the core of stagflation-driven FIRE failures).
         adj = np.where(wd_rate > fire_swr * 1.25, 0.90,  # 25% above target SWR: cut spending
-                       np.where(wd_rate < fire_swr * 0.75, 1.10, 1+INFLATION))  # 25% below: increase
+                       np.where(wd_rate < fire_swr * 0.75, 1.10, 1 + inf_rates[i]))  # 25% below: increase
         ret_base_spend = np.where(fired, ret_base_spend*adj, ret_base_spend)
 
         if age < 60:
