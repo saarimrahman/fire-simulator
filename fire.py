@@ -190,6 +190,7 @@ class FamilyConfig:
     spouse_works: bool = True             # Easy toggle to disable spouse income entirely
     spouse_salary: float = 80000          # Base full-time salary at marriage
     spouse_salary_growth: float = 0.03    # Annual growth rate
+    spouse_soft_cap: float = 150000       # Salary ceiling (growth tapers near this, like main earner)
     part_time_fraction: float = 0.5       # Part-time as fraction of full-time
 
     # Timeline: spouse stops working before first kid, resumes part-time when youngest starts school
@@ -241,6 +242,11 @@ def calc_spouse_income(age: int, cfg: FamilyConfig, inflation: float, noise: flo
     - Marriage → 1yr before first kid: Full-time
     - 1yr before first kid → last kid turns 5: $0 (child-rearing gap)
     - Last kid turns 5 onward: Part-time permanently
+
+    Salary growth is capped similar to main earner:
+    - Below 60% of cap: full growth
+    - 60-100% of cap: tapered growth
+    - Above cap: capped at ceiling
     """
     if not cfg.spouse_works or age < cfg.marriage_age:
         return 0.0
@@ -258,8 +264,29 @@ def calc_spouse_income(age: int, cfg: FamilyConfig, inflation: float, noise: flo
     else:
         fraction = 1.0  # No kids = always full-time
 
+    # Calculate salary with soft cap (similar to main earner's TC cap)
     years_since_marriage = age - cfg.marriage_age
-    salary = cfg.spouse_salary * ((1 + cfg.spouse_salary_growth) ** years_since_marriage)
+    base_salary = cfg.spouse_salary
+    soft_cap = cfg.spouse_soft_cap
+
+    # Apply growth year by year with tapering near cap
+    salary = base_salary
+    for _ in range(years_since_marriage):
+        cap_ratio = salary / soft_cap
+        if cap_ratio < 0.6:
+            # Below 60% of cap: full growth
+            growth = cfg.spouse_salary_growth
+        elif cap_ratio < 1.0:
+            # 60-100% of cap: tapered growth (linear decay to ~30% of normal growth)
+            growth = cfg.spouse_salary_growth * (1 - cap_ratio) / 0.4 * 0.3
+        else:
+            # Above cap: no growth (capped)
+            growth = 0.0
+        salary = salary * (1 + growth)
+
+    # Cap at soft cap
+    salary = min(salary, soft_cap)
+
     return salary * fraction * inflation * noise
 
 
