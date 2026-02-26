@@ -128,9 +128,12 @@ def get_all_cities():
     """Return the current CITIES dict."""
     return CITIES
 
-def calc_taxes_vec(gross, state_rate, t401k=0, hsa_c=0, inf=1.0):
+def calc_taxes_vec(gross, state_rate, t401k=0, hsa_c=0, inf=1.0, include_fica=True):
     agi = gross - t401k - hsa_c
-    fica = np.minimum(gross, 168600*inf) * 0.0765 + np.maximum(0, gross - 168600*inf) * 0.0145
+    if include_fica:
+        fica = np.minimum(gross, 168600*inf) * 0.0765 + np.maximum(0, gross - 168600*inf) * 0.0145
+    else:
+        fica = np.zeros_like(gross, dtype=float)
     taxable = np.maximum(0, agi - 29200*inf)
     brackets = [(23200*inf,0.10),(71000*inf,0.12),(106750*inf,0.22),(182750*inf,0.24),(103550*inf,0.32),(243750*inf,0.35),(1e15,0.37)]
     federal = np.zeros_like(gross, dtype=float)
@@ -178,6 +181,7 @@ class SimulationResults:
     savings_roth: np.ndarray        # (N_YEARS, N) Roth IRA contributions
     savings_hsa: np.ndarray         # (N_YEARS, N) HSA contributions
     savings_taxable: np.ndarray     # (N_YEARS, N) taxable account contributions
+    social_security_income: np.ndarray  # (N_YEARS, N) after-tax Social Security income
 
 @dataclass
 class FamilyConfig:
@@ -221,6 +225,33 @@ class CareerConfig:
     # 401k employer match
     employer_match_pct: float = 0.50      # 50% match (common default)
     employer_match_limit: float = 0.06    # Match up to 6% of salary
+
+
+@dataclass
+class SocialSecurityConfig:
+    """Configuration for Social Security income during retirement."""
+    enabled: bool = False
+    claim_age: int = 67
+    annual_benefit: float = 32000.0         # In today's dollars
+    include_spouse: bool = True
+    spouse_annual_benefit: float = 18000.0  # In today's dollars
+    inflation_indexed: bool = True
+    effective_tax_rate: float = 0.10        # Applied as a simple tax drag
+
+
+def calc_social_security_income(age: int, cfg: SocialSecurityConfig, inflation_mult, spouse_eligible):
+    """Return (gross, after-tax) Social Security income arrays for the given age."""
+    spouse_eligible = spouse_eligible.astype(bool)
+    zeros = np.zeros_like(spouse_eligible, dtype=float)
+    if (not cfg.enabled) or (age < cfg.claim_age):
+        return zeros, zeros
+
+    cola = inflation_mult if cfg.inflation_indexed else 1.0
+    spouse_component = np.where(cfg.include_spouse & spouse_eligible, cfg.spouse_annual_benefit, 0.0)
+    gross = (cfg.annual_benefit + spouse_component) * cola
+    tax_rate = np.clip(cfg.effective_tax_rate, 0.0, 1.0)
+    after_tax = gross * (1 - tax_rate)
+    return gross, after_tax
 
 
 # Cumulative promotion probabilities by trajectory
@@ -361,7 +392,7 @@ def simulate_career_growth(
 
     # Simulate year by year
     for year_idx in range(n_years):
-        age = CURRENT_AGE + year_idx
+        age = current_age + year_idx
 
         # Store current TC
         incomes[year_idx] = tc.copy()
@@ -405,13 +436,16 @@ def simulate_career_growth(
     return incomes
 
 def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, family_config=None,
-                   career_config=None, return_trajectories=False, life_expectancy=None, current_age=None):
+                   career_config=None, social_security_config=None, allow_home_purchase=True,
+                   return_trajectories=False, life_expectancy=None, current_age=None):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
         or {'taxable': 165000, '401k': 75000, 'roth': 45000, 'hsa': 15000}
     family_config: FamilyConfig dataclass for spouse/kid settings
     career_config: CareerConfig dataclass for salary progression settings
+    social_security_config: SocialSecurityConfig dataclass for Social Security assumptions
+    allow_home_purchase: whether to allow buying a home in this run
     return_trajectories: if True, return SimulationResults with full trajectory data
     life_expectancy: age to simulate through (default: LIFE_EXPECTANCY constant)
     current_age: starting age for simulation (default: CURRENT_AGE constant)
@@ -447,6 +481,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         traj_savings_roth = np.zeros((n_years, N))
         traj_savings_hsa = np.zeros((n_years, N))
         traj_savings_taxable = np.zeros((n_years, N))
+        traj_social_security = np.zeros((n_years, N))
 
     if seed_amounts is None:
         seed_amounts = SeedAmounts()
@@ -465,6 +500,9 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     if career_config is None:
         career_config = CareerConfig()
 
+    if social_security_config is None:
+        social_security_config = SocialSecurityConfig()
+
     # Derive kid ages from config
     kid_ages = sorted(family_config.kid_ages) if family_config.kid_ages else []
     kid1_born = kid_ages[0] if len(kid_ages) >= 1 else 999
@@ -475,9 +513,11 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
     spouse_noise = np.maximum(rng.normal(1.0, 0.1, size=(n_years, N)), 0.5)
     spouse_works_roll = rng.random(N) < 0.90  # 90% chance spouse works when in working period
+    spouse_ss_eligible = spouse_works_roll if family_config.spouse_works else np.zeros(N, dtype=bool)
     recession = rng.random(size=(n_years, N)) < 0.15
     mr_arr = np.where(recession, rng.normal(-0.10, 0.12, size=(n_years, N)),
                       rng.normal(0.09, 0.14, size=(n_years, N)))
+    mr_arr = np.clip(mr_arr, -0.80, 0.60)  # Keep annual returns in plausible bounds
     jl_roll = rng.random(size=(n_years, N))
     jl_thresh = np.where(recession, 0.15, 0.03)
     hs_roll = rng.random(size=(n_years, N))
@@ -516,7 +556,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config, current_age=current_age)
 
     # Add spouse income based on family config
-    for i, age in enumerate(range(current_age, FIRE_HORIZON + 1)):
+    for i, age in enumerate(range(current_age, min(FIRE_HORIZON, life_expectancy) + 1)):
         spouse_inc = calc_spouse_income(age, family_config, infl[i], noise=1.0)
         incomes[i] += spouse_inc * spouse_noise[i] * spouse_works_roll
 
@@ -536,7 +576,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     fire_ages = np.full(N, 99, dtype=int); fixed_pmt = np.zeros(N)
     ret_base_spend = np.zeros(N)
     fire_swr = np.full(N, SWR_DEFAULT)  # Track SWR at FIRE time for each simulation
-    has_home = cfg.home_price is not None
+    has_home = allow_home_purchase and (cfg.home_price is not None)
     home_purchase_age = np.zeros(N, dtype=int)  # Age when each sim buys; 0 = never bought
 
     # Track portfolio failures (ran out of money before life expectancy)
@@ -549,6 +589,13 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         # Income is zero after FIRE or after FIRE_HORIZON (forced retirement).
         # incomes has n_years rows so indexing with i is always in-bounds.
         year_inc = np.where(fired | (age > FIRE_HORIZON), 0.0, incomes[i])
+        spouse_ss_claim = (age >= family_config.marriage_age) & spouse_ss_eligible
+        _, social_security_after_tax = calc_social_security_income(
+            age=age,
+            cfg=social_security_config,
+            inflation_mult=inf,
+            spouse_eligible=spouse_ss_claim,
+        )
 
         if age < 28:
             housing = cfg.one_br_rent*12*inf*np.ones(N); disc = 30000*inf*np.ones(N); st = 0.055
@@ -640,47 +687,53 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         hsa_c = np.where(~fired & (year_inc > 0), (HSA_FAMILY_LIMIT if age >= kid1_born else 4150)*inf, 0.0)
         taxes = np.where(~fired, calc_taxes_vec(year_inc, st, t401k_c, hsa_c, inf), 0.0)
 
-        net_inc = year_inc - taxes - total_spend
+        net_inc = year_inc + social_security_after_tax - taxes - total_spend
         wp = (~fired) & (net_inc > 0)
         a401 = np.where(wp, np.minimum(t401k_c, net_inc*0.5), 0)
         ar = np.where(wp, np.minimum(ROTH_IRA_LIMIT*inf, net_inc*0.3), 0)
         ah = np.where(wp, np.minimum(hsa_c, net_inc*0.2), 0)
+        taxable_contrib = np.where(wp, net_inc - a401 - ar - ah, 0)
         # Calculate employer 401k match (free money, not from net_inc)
         matchable_salary = year_inc * career_config.employer_match_limit
         matchable = np.minimum(matchable_salary, a401)
         employer_match = np.where(wp, matchable * career_config.employer_match_pct, 0)
         t401k += a401 + employer_match; roth += ar; roth_basis += ar; hsa_bal += ah
-        taxable += np.where(wp, net_inc-a401-ar-ah, 0)
+        taxable += taxable_contrib
         taxable += np.where((~fired)&(net_inc<=0), net_inc, 0)
         # Can't overdraft a brokerage — clamp working-year deficit draw at zero
         taxable = np.maximum(taxable, 0)
 
         total_port = taxable + t401k + roth + hsa_bal
         ret_base_spend = np.where(fired & (ret_base_spend==0), total_spend, ret_base_spend)
-        wd_rate = np.where(fired & (total_port > 0), ret_base_spend/np.maximum(total_port, 1), 0)
+        retirement_draw = np.where(fired, np.maximum(ret_base_spend - social_security_after_tax, 0), 0)
+        retirement_surplus = np.where(fired, np.maximum(social_security_after_tax - ret_base_spend, 0), 0)
+        taxable += retirement_surplus
+        total_port = taxable + t401k + roth + hsa_bal
+        wd_rate = np.where(fired & (total_port > 0), retirement_draw/np.maximum(total_port, 1), 0)
         # Use fire_swr (SWR at retirement) for withdrawal rate bounds instead of hardcoded values.
         # Normal case uses actual stochastic inflation for this year/sim so high-inflation years
         # correctly force higher spending growth (the core of stagflation-driven FIRE failures).
         adj = np.where(wd_rate > fire_swr * 1.25, 0.90,  # 25% above target SWR: cut spending
                        np.where(wd_rate < fire_swr * 0.75, 1.10, 1 + inf_rates[i]))  # 25% below: increase
         ret_base_spend = np.where(fired, ret_base_spend*adj, ret_base_spend)
+        retirement_draw = np.where(fired, np.maximum(ret_base_spend - social_security_after_tax, 0), 0)
 
         if age < 60:
             # Pre-60 withdrawal: taxable first, then Roth basis, then HSA, then 401k with penalty
             active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
-            draw = np.where(active_retired, ret_base_spend, 0)
+            draw = np.where(active_retired, retirement_draw, 0)
             d_tax = np.minimum(draw, np.maximum(taxable, 0)); rem1 = draw - d_tax
             d_roth = np.minimum(rem1, np.maximum(roth_basis, 0)); rem2 = rem1 - d_roth
             d_hsa = np.minimum(rem2*0.5, np.maximum(hsa_bal, 0)); rem3 = rem2 - d_hsa
-            pen = rem3*0.10; tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax, inf=inf)
+            pen = rem3*0.10; tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax, inf=inf, include_fica=False)
             taxable -= d_tax; roth -= d_roth; roth_basis -= d_roth; hsa_bal -= d_hsa
             t401k -= np.where(active_retired, rem3+pen+tax_401, 0)
         else:
             # Post-60 withdrawal: proportional from all accounts
             active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
             sp = np.maximum(total_port, 1); tf = t401k/sp
-            rt = np.where(active_retired, calc_taxes_vec(ret_base_spend*tf, cfg.retirement_state_tax, inf=inf), 0)
-            td = np.where(active_retired, ret_base_spend+rt, 0)
+            rt = np.where(active_retired, calc_taxes_vec(retirement_draw*tf, cfg.retirement_state_tax, inf=inf, include_fica=False), 0)
+            td = np.where(active_retired, retirement_draw+rt, 0)
             taxable -= np.where(active_retired, td*taxable/sp, 0); t401k -= np.where(active_retired, td*t401k/sp, 0)
             roth -= np.where(active_retired, td*roth/sp, 0); hsa_bal -= np.where(active_retired, td*hsa_bal/sp, 0)
 
@@ -693,19 +746,24 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
         # Apply market returns (skip failed portfolios to avoid overflow)
         hr = (1+mr)**0.5-1; wm = ~fired
-        ns = np.where(wm & (net_inc > 0), net_inc, 0)
+        ns = np.where(wm & (taxable_contrib > 0), taxable_contrib, 0)
         active = ~failed
         taxable = np.where(active & wm, (taxable-ns)*(1+mr)+ns*(1+hr), np.where(active, taxable*(1+mr), taxable))
         t401k = np.where(active, t401k*(1+mr), t401k)
         roth = np.where(active, roth*(1+mr), roth)
         hsa_bal = np.where(active, hsa_bal*(1+mr*0.8), hsa_bal)
+        taxable = np.maximum(taxable, 0)
+        t401k = np.maximum(t401k, 0)
+        roth = np.maximum(roth, 0)
+        roth_basis = np.minimum(roth_basis, roth)
+        hsa_bal = np.maximum(hsa_bal, 0)
 
         total_liq = taxable + t401k + roth + hsa_bal + c529_1 + c529_2
         accessible = taxable + roth_basis + hsa_bal
 
         # Record trajectory data
         if return_trajectories:
-            traj_incomes[i] = incomes[i]
+            traj_incomes[i] = year_inc
             traj_spending[i] = total_spend
             traj_taxable[i] = taxable.copy()
             traj_t401k[i] = t401k.copy()
@@ -726,7 +784,8 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             traj_savings_401k[i] = a401
             traj_savings_roth[i] = ar
             traj_savings_hsa[i] = ah
-            traj_savings_taxable[i] = np.where(wp, net_inc - a401 - ar - ah, 0)
+            traj_savings_taxable[i] = taxable_contrib
+            traj_social_security[i] = social_security_after_tax
 
         # Check for FIRE eligibility only during working years (up to FIRE_HORIZON)
         if 30 <= age <= FIRE_HORIZON:
@@ -789,15 +848,22 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             savings_roth=traj_savings_roth,
             savings_hsa=traj_savings_hsa,
             savings_taxable=traj_savings_taxable,
+            social_security_income=traj_social_security,
         )
     return fire_ages, failed, failure_ages
 
-def find_min_tc(city, target_age, conf_pct, seed_amounts=None, family_config=None, career_config=None, lo=100000, hi=700000, tol=5000):
+def find_min_tc(city, target_age, conf_pct, seed_amounts=None, family_config=None,
+                career_config=None, social_security_config=None, allow_home_purchase=True,
+                life_expectancy=None, current_age=None,
+                lo=100000, hi=700000, tol=5000):
     while hi - lo > tol:
         mid = round((lo + hi) / 2 / 5000) * 5000
         rng = np.random.default_rng(42)
         fire_ages, _, _ = run_vectorized(mid, city, N_SIMS, rng, seed_amounts=seed_amounts,
-                                          family_config=family_config, career_config=career_config)
+                                          family_config=family_config, career_config=career_config,
+                                          social_security_config=social_security_config,
+                                          allow_home_purchase=allow_home_purchase,
+                                          life_expectancy=life_expectancy, current_age=current_age)
         pct = (fire_ages <= target_age).mean() * 100
         if pct >= conf_pct:
             hi = mid

@@ -10,7 +10,7 @@ from datetime import date
 
 from fire import (
     run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SimulationResults,
-    CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
+    SocialSecurityConfig, CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
 )
 
 st.set_page_config(page_title="FIRE Simulator", page_icon="🔥", layout="wide")
@@ -142,6 +142,39 @@ with st.sidebar:
             help="Simulation runs through this age to check if portfolio survives"
         )
 
+    with st.expander("Social Security", expanded=False):
+        ss_enabled = st.toggle("Enable Social Security", value=True)
+        ss_claim_age = st.slider(
+            "Claiming Age",
+            min_value=62, max_value=70, value=67, step=1,
+            disabled=not ss_enabled
+        )
+        ss_annual_benefit = st.slider(
+            "Your Annual Benefit ($)",
+            min_value=10000, max_value=70000, value=32000, step=1000,
+            format="$%d", disabled=not ss_enabled
+        )
+        ss_include_spouse = st.toggle(
+            "Include Spouse Benefit",
+            value=spouse_works,
+            disabled=not ss_enabled
+        )
+        ss_spouse_benefit = st.slider(
+            "Spouse Annual Benefit ($)",
+            min_value=0, max_value=50000, value=18000, step=1000,
+            format="$%d", disabled=(not ss_enabled) or (not ss_include_spouse)
+        )
+        ss_inflation_indexed = st.toggle(
+            "Inflation-Indexed Benefit",
+            value=True,
+            disabled=not ss_enabled
+        )
+        ss_effective_tax_rate = st.slider(
+            "Effective SS Tax Rate (%)",
+            min_value=0, max_value=30, value=10, step=1,
+            format="%d%%", disabled=not ss_enabled
+        ) / 100.0
+
 # =============================================================================
 # RUN SIMULATION
 # =============================================================================
@@ -164,7 +197,9 @@ family_config = FamilyConfig(
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age):
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+            ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+            ss_inflation_indexed, ss_effective_tax_rate, buy_home, current_age):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -174,9 +209,20 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
         soft_cap=tc_soft_cap, trajectory=career_trajectory,
         employer_match_pct=employer_match_pct, employer_match_limit=employer_match_limit
     )
+    social_security = SocialSecurityConfig(
+        enabled=ss_enabled,
+        claim_age=ss_claim_age,
+        annual_benefit=ss_annual_benefit,
+        include_spouse=ss_include_spouse,
+        spouse_annual_benefit=ss_spouse_benefit,
+        inflation_indexed=ss_inflation_indexed,
+        effective_tax_rate=ss_effective_tax_rate,
+    )
     rng = np.random.default_rng(42)
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
                           family_config=family, career_config=career,
+                          social_security_config=social_security,
+                          allow_home_purchase=buy_home,
                           return_trajectories=True, life_expectancy=life_exp,
                           current_age=current_age)
 
@@ -184,7 +230,9 @@ with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+        ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+        ss_inflation_indexed, ss_effective_tax_rate, buy_home, start_age
     )
 
 # =============================================================================
@@ -232,7 +280,7 @@ if pct_failed_after_fire > 0:
         3. **Spending Adjustments Lag**: The 10% spending cuts when withdrawal rate > 5% may not be enough in extreme scenarios
 
         This {pct_failed_after_fire:.1f}% failure rate shows the simulation is capturing realistic tail risk.
-        In practice, you'd have additional levers like Social Security, downsizing, part-time work, etc.
+        In practice, you'd have additional levers like delaying Social Security claims, downsizing, or part-time work.
         """)
 
 # =============================================================================
@@ -357,15 +405,16 @@ with tab2:
                      int(median_fire_age) if median_fire_age else 45)
     }
 
-    start_age, end_age = stage_ranges[life_stage]
+    stage_start_age, stage_end_age = stage_ranges[life_stage]
 
     # Get indices for the age range
-    age_mask = (results.ages >= start_age) & (results.ages <= end_age)
+    age_mask = (results.ages >= stage_start_age) & (results.ages <= stage_end_age)
     age_indices = np.where(age_mask)[0]
 
     if len(age_indices) > 0:
         # Calculate median flows across the period
         income_flow = np.median(results.incomes[age_indices, :])
+        social_security_flow = np.median(results.social_security_income[age_indices, :])
         taxes_flow = np.median(results.taxes[age_indices, :])
 
         # Spending categories
@@ -397,7 +446,8 @@ with tab2:
             "401(k) Savings",    # 9
             "Roth IRA Savings",  # 10
             "HSA Savings",       # 11
-            "Taxable Savings"    # 12
+            "Taxable Savings",   # 12
+            "Social Security"    # 13
         ]
 
         # Links: source, target, value, color
@@ -407,10 +457,16 @@ with tab2:
         if taxes_flow > 0:
             links.append((0, 1, taxes_flow, 'rgba(239, 85, 59, 0.4)'))
 
+        # Social Security -> Net Income
+        if social_security_flow > 0:
+            links.append((13, 2, social_security_flow, 'rgba(25, 211, 243, 0.5)'))
+
         # Income -> Net Income
-        net_income = income_flow - taxes_flow
+        earned_net_income = max(income_flow - taxes_flow, 0)
+        net_income = earned_net_income + social_security_flow
         if net_income > 0:
-            links.append((0, 2, net_income, 'rgba(99, 110, 250, 0.4)'))
+            if earned_net_income > 0:
+                links.append((0, 2, earned_net_income, 'rgba(99, 110, 250, 0.4)'))
 
         # Net Income -> Spending categories
         if housing_flow > 0:
@@ -448,7 +504,7 @@ with tab2:
                 label=nodes,
                 color=['#636EFA', '#EF553B', '#636EFA', '#FFA15A', '#AB63FA',
                        '#FF6384', '#FFCE56', '#4BC0C0', '#9966FF', '#00CC96',
-                       '#00CC96', '#00CC96', '#00CC96']
+                       '#00CC96', '#00CC96', '#00CC96', '#19D3F3']
             ),
             link=dict(
                 source=list(sources),
@@ -459,7 +515,7 @@ with tab2:
         )])
 
         fig.update_layout(
-            title=f"Median Annual Cash Flow (Age {start_age}-{end_age})",
+            title=f"Median Annual Cash Flow (Age {stage_start_age}-{stage_end_age})",
             font_size=12,
             height=600
         )
@@ -468,7 +524,7 @@ with tab2:
         # Summary metrics
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Gross Income", f"${income_flow:,.0f}")
+            st.metric("Total Income", f"${income_flow + social_security_flow:,.0f}")
         with col2:
             st.metric("Total Spending", f"${housing_flow + disc_flow + kids_flow + edu_flow + hc_flow + ot_flow:,.0f}")
         with col3:
@@ -560,8 +616,8 @@ with tab3:
         stage_data = {cat: [] for cat in categories}
         stage_names = []
 
-        for stage_name, (start_age, end_age) in stages.items():
-            age_mask = (results.ages >= start_age) & (results.ages <= end_age)
+        for stage_name, (stage_start_age, stage_end_age) in stages.items():
+            age_mask = (results.ages >= stage_start_age) & (results.ages <= stage_end_age)
             age_indices = np.where(age_mask)[0]
 
             if len(age_indices) > 0:
@@ -644,67 +700,71 @@ with tab7:
     if outcome_selector == "Ending Net Worth (at life expectancy)":
         # Get net worth at last age
         ending_nw = results.net_worth[-1, :]  # Keep in dollars
-        valid_data = ending_nw[ending_nw > 0]  # Exclude failures
+        valid_data = ending_nw[np.isfinite(ending_nw)]
+        if len(valid_data) == 0:
+            st.warning("No ending net-worth data available.")
+        else:
+            # Trim extreme outliers for better visualization
+            p1 = np.percentile(valid_data, 1)
+            p99 = np.percentile(valid_data, 99)
+            trimmed_data = valid_data[(valid_data >= p1) & (valid_data <= p99)]
+            if len(trimmed_data) == 0:
+                trimmed_data = valid_data
 
-        # Trim extreme outliers for better visualization
-        p1 = np.percentile(valid_data, 1)
-        p99 = np.percentile(valid_data, 99)
-        trimmed_data = valid_data[(valid_data >= p1) & (valid_data <= p99)]
+            fig = go.Figure()
 
-        fig = go.Figure()
+            # Calculate appropriate bin size (around 100-200k increments)
+            data_range = max(trimmed_data.max() - trimmed_data.min(), 1)
+            bin_size = max(100000, data_range / 50)  # At least 100k bins, or 50 bins total
 
-        # Calculate appropriate bin size (around 100-200k increments)
-        data_range = trimmed_data.max() - trimmed_data.min()
-        bin_size = max(100000, data_range / 50)  # At least 100k bins, or 50 bins total
+            fig.add_trace(go.Histogram(
+                x=trimmed_data,
+                xbins=dict(
+                    start=trimmed_data.min(),
+                    end=trimmed_data.max(),
+                    size=bin_size
+                ),
+                marker_color='#636EFA',
+                name='Ending Net Worth'
+            ))
 
-        fig.add_trace(go.Histogram(
-            x=trimmed_data,
-            xbins=dict(
-                start=trimmed_data.min(),
-                end=trimmed_data.max(),
-                size=bin_size
-            ),
-            marker_color='#636EFA',
-            name='Ending Net Worth'
-        ))
+            # Add percentile markers
+            p10 = np.percentile(valid_data, 10)
+            p50 = np.percentile(valid_data, 50)
+            p90 = np.percentile(valid_data, 90)
 
-        # Add percentile markers
-        p10 = np.percentile(valid_data, 10)
-        p50 = np.percentile(valid_data, 50)
-        p90 = np.percentile(valid_data, 90)
+            # Only add markers if they're within the visible range
+            if p1 <= p10 <= p99:
+                fig.add_vline(x=p10, line_dash="dash", line_color="red",
+                              annotation_text=f"P10: ${p10:,.0f}", annotation_position="top")
+            if p1 <= p50 <= p99:
+                fig.add_vline(x=p50, line_dash="solid", line_color="green",
+                              annotation_text=f"P50: ${p50:,.0f}", annotation_position="top")
+            if p1 <= p90 <= p99:
+                fig.add_vline(x=p90, line_dash="dash", line_color="blue",
+                              annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
 
-        # Only add markers if they're within the visible range
-        if p1 <= p10 <= p99:
-            fig.add_vline(x=p10, line_dash="dash", line_color="red",
-                          annotation_text=f"P10: ${p10:,.0f}", annotation_position="top")
-        if p1 <= p50 <= p99:
-            fig.add_vline(x=p50, line_dash="solid", line_color="green",
-                          annotation_text=f"P50: ${p50:,.0f}", annotation_position="top")
-        if p1 <= p90 <= p99:
-            fig.add_vline(x=p90, line_dash="dash", line_color="blue",
-                          annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
+            fig.update_layout(
+                xaxis_title=f"Net Worth at Age {life_expectancy} (P1-P99 range shown)",
+                xaxis=dict(tickformat='$,.0f'),
+                yaxis_title="Count",
+                height=500
+            )
 
-        fig.update_layout(
-            xaxis_title=f"Net Worth at Age {life_expectancy} (P1-P99 range shown)",
-            xaxis=dict(tickformat='$,.0f'),
-            yaxis_title="Count",
-            height=500
-        )
+            # Summary statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Mean", f"${np.mean(valid_data):,.0f}")
+            with col2:
+                st.metric("Median", f"${p50:,.0f}")
+            with col3:
+                st.metric("Std Dev", f"${np.std(valid_data):,.0f}")
+            with col4:
+                pct_survived = (~results.failed).mean() * 100
+                st.metric("Survived", f"{pct_survived:.1f}%")
 
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Mean", f"${np.mean(valid_data):,.0f}")
-        with col2:
-            st.metric("Median", f"${p50:,.0f}")
-        with col3:
-            st.metric("Std Dev", f"${np.std(valid_data):,.0f}")
-        with col4:
-            pct_survived = len(valid_data) / len(ending_nw) * 100
-            st.metric("Survived", f"{pct_survived:.1f}%")
-
-        st.caption(f"📊 Showing P1-P99 range (${p1:,.0f} - ${p99:,.0f}) to focus on main distribution. Excludes {len(valid_data) - len(trimmed_data)} extreme outliers.")
-        st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"📊 Showing P1-P99 range (${p1:,.0f} - ${p99:,.0f}) to focus on main distribution. Excludes {len(valid_data) - len(trimmed_data)} extreme outliers.")
+            st.plotly_chart(fig, use_container_width=True)
 
     elif outcome_selector == "Net Worth at FIRE":
         # Get net worth at FIRE age for each simulation
@@ -858,45 +918,47 @@ with tab7:
 
     elif outcome_selector == "Years Until FIRE":
         years_to_fire = fire_ages_valid - start_age
+        if len(years_to_fire) == 0:
+            st.warning("No simulations reached FIRE")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(
+                x=years_to_fire,
+                nbinsx=30,
+                marker_color='#AB63FA',
+                name='Years Until FIRE'
+            ))
 
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(
-            x=years_to_fire,
-            nbinsx=30,
-            marker_color='#AB63FA',
-            name='Years Until FIRE'
-        ))
+            # Add percentile markers
+            p10 = np.percentile(years_to_fire, 10)
+            p50 = np.percentile(years_to_fire, 50)
+            p90 = np.percentile(years_to_fire, 90)
 
-        # Add percentile markers
-        p10 = np.percentile(years_to_fire, 10)
-        p50 = np.percentile(years_to_fire, 50)
-        p90 = np.percentile(years_to_fire, 90)
+            fig.add_vline(x=p10, line_dash="dash", line_color="red",
+                          annotation_text=f"P10: {p10:.1f} yrs", annotation_position="top")
+            fig.add_vline(x=p50, line_dash="solid", line_color="green",
+                          annotation_text=f"P50: {p50:.1f} yrs", annotation_position="top")
+            fig.add_vline(x=p90, line_dash="dash", line_color="blue",
+                          annotation_text=f"P90: {p90:.1f} yrs", annotation_position="top")
 
-        fig.add_vline(x=p10, line_dash="dash", line_color="red",
-                      annotation_text=f"P10: {p10:.1f} yrs", annotation_position="top")
-        fig.add_vline(x=p50, line_dash="solid", line_color="green",
-                      annotation_text=f"P50: {p50:.1f} yrs", annotation_position="top")
-        fig.add_vline(x=p90, line_dash="dash", line_color="blue",
-                      annotation_text=f"P90: {p90:.1f} yrs", annotation_position="top")
+            fig.update_layout(
+                xaxis_title="Years Until FIRE",
+                yaxis_title="Count",
+                height=500
+            )
 
-        fig.update_layout(
-            xaxis_title="Years Until FIRE",
-            yaxis_title="Count",
-            height=500
-        )
+            # Summary statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Mean", f"{np.mean(years_to_fire):.1f} yrs")
+            with col2:
+                st.metric("Median", f"{p50:.1f} yrs")
+            with col3:
+                st.metric("Std Dev", f"{np.std(years_to_fire):.1f} yrs")
+            with col4:
+                st.metric("FIRE Rate", f"{pct_fire:.1f}%")
 
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Mean", f"{np.mean(years_to_fire):.1f} yrs")
-        with col2:
-            st.metric("Median", f"{p50:.1f} yrs")
-        with col3:
-            st.metric("Std Dev", f"{np.std(years_to_fire):.1f} yrs")
-        with col4:
-            st.metric("FIRE Rate", f"{pct_fire:.1f}%")
-
-        st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
 
 # Chart 4: Account Composition Stacked Area
 with tab4:
@@ -951,16 +1013,29 @@ with tab5:
     st.subheader("Income vs Spending Trajectories (Median)")
 
     ages = results.ages
-    income_med = np.median(results.incomes, axis=1)
+    earned_income_med = np.median(results.incomes, axis=1)
+    ss_income_med = np.median(results.social_security_income, axis=1)
+    income_med = earned_income_med + ss_income_med
     spending_med = np.median(results.spending, axis=1)
 
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
         x=ages, y=income_med,
-        mode='lines', name='Household Income',
+        mode='lines', name='Total Income',
         line=dict(color='#00CC96', width=2)
     ))
+    fig.add_trace(go.Scatter(
+        x=ages, y=earned_income_med,
+        mode='lines', name='Earned Income',
+        line=dict(color='#636EFA', width=1, dash='dot')
+    ))
+    if np.any(ss_income_med > 0):
+        fig.add_trace(go.Scatter(
+            x=ages, y=ss_income_med,
+            mode='lines', name='Social Security (After Tax)',
+            line=dict(color='#19D3F3', width=1, dash='dash')
+        ))
     fig.add_trace(go.Scatter(
         x=ages, y=spending_med,
         mode='lines', name='Total Spending',
@@ -999,22 +1074,43 @@ with tab8:
 
     # Also run comparison with zero seed
     @st.cache_data
-    def run_comparison_sim(starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp, career_traj, soft_cap, emp_match_pct, emp_match_limit):
+    def run_comparison_sim(starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works,
+                           spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
+                           career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                           ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse,
+                           ss_spouse_benefit, ss_inflation_indexed, ss_effective_tax_rate,
+                           buy_home, current_age):
         family = FamilyConfig(
             marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
-            spouse_salary=spouse_salary, part_time_fraction=part_time_fraction
+            spouse_salary=spouse_salary, spouse_soft_cap=spouse_soft_cap,
+            part_time_fraction=part_time_fraction
         )
         career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
                              employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
+        social_security = SocialSecurityConfig(
+            enabled=ss_enabled,
+            claim_age=ss_claim_age,
+            annual_benefit=ss_annual_benefit,
+            include_spouse=ss_include_spouse,
+            spouse_annual_benefit=ss_spouse_benefit,
+            inflation_indexed=ss_inflation_indexed,
+            effective_tax_rate=ss_effective_tax_rate,
+        )
         rng = np.random.default_rng(42)
         fire_ages, _, _ = run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=SeedAmounts(),
                               family_config=family, career_config=career,
-                              return_trajectories=False, life_expectancy=life_exp)
+                              social_security_config=social_security,
+                              allow_home_purchase=buy_home,
+                              return_trajectories=False, life_expectancy=life_exp,
+                              current_age=current_age)
         return fire_ages
 
     zero_seed_ages = run_comparison_sim(
-        starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+        starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works,
+        spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+        ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+        ss_inflation_indexed, ss_effective_tax_rate, buy_home, start_age
     )
     cdf_zero = [(zero_seed_ages <= age).mean() * 100 for age in ages_range]
 
@@ -1054,8 +1150,11 @@ with tab9:
     else:
         @st.cache_data
         def run_sensitivity(base_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
-                           marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                           career_traj, soft_cap, emp_match_pct, emp_match_limit):
+                           marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction,
+                           career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                           ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse,
+                           ss_spouse_benefit, ss_inflation_indexed, ss_effective_tax_rate,
+                           buy_home, life_exp, current_age):
             results = {}
             base_params = {
                 'starting_tc': base_tc,
@@ -1079,15 +1178,28 @@ with tab9:
                     family = FamilyConfig(
                         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
                         spouse_salary=val if param == 'spouse_salary' else spouse_salary,
+                        spouse_soft_cap=spouse_soft_cap,
                         part_time_fraction=part_time_fraction
                     )
                     career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
                                          employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
+                    social_security = SocialSecurityConfig(
+                        enabled=ss_enabled,
+                        claim_age=ss_claim_age,
+                        annual_benefit=ss_annual_benefit,
+                        include_spouse=ss_include_spouse,
+                        spouse_annual_benefit=ss_spouse_benefit,
+                        inflation_indexed=ss_inflation_indexed,
+                        effective_tax_rate=ss_effective_tax_rate,
+                    )
                     tc = val if param == 'starting_tc' else base_tc
                     rng = np.random.default_rng(42)
                     fire_ages, _, _ = run_vectorized(tc, city, n_sims, rng, seed_amounts=seed,
                                               family_config=family, career_config=career,
-                                              return_trajectories=False)
+                                              social_security_config=social_security,
+                                              allow_home_purchase=buy_home,
+                                              return_trajectories=False, life_expectancy=life_exp,
+                                              current_age=current_age)
                     valid = fire_ages[fire_ages < 99]
                     ages_list.append(np.median(valid) if len(valid) > 0 else 99)
 
@@ -1097,8 +1209,10 @@ with tab9:
 
         sensitivity = run_sensitivity(
             starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
-            marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+            marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction,
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+            ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+            ss_inflation_indexed, ss_effective_tax_rate, buy_home, life_expectancy, start_age
         )
 
         params = []
@@ -1151,22 +1265,42 @@ table_mode = st.radio(
 
 @st.cache_data
 def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
-                         marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit):
+                         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction,
+                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                         ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+                         ss_inflation_indexed, ss_effective_tax_rate, buy_home, life_exp, current_age):
     ages_to_check = [40, 42, 44, 46, 48, 50, 52, 55]
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
-        spouse_salary=spouse_salary, part_time_fraction=part_time_fraction
+        spouse_salary=spouse_salary, spouse_soft_cap=spouse_soft_cap, part_time_fraction=part_time_fraction
     )
     career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
                          employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
+    social_security = SocialSecurityConfig(
+        enabled=ss_enabled,
+        claim_age=ss_claim_age,
+        annual_benefit=ss_annual_benefit,
+        include_spouse=ss_include_spouse,
+        spouse_annual_benefit=ss_spouse_benefit,
+        inflation_indexed=ss_inflation_indexed,
+        effective_tax_rate=ss_effective_tax_rate,
+    )
 
     data = []
     for city_name in city_names:
         row = {'City': city_name}
         for ta in ages_to_check:
-            tc = find_min_tc(city_name, ta, 90, seed_amounts=seed, family_config=family, career_config=career)
+            tc = find_min_tc(
+                city_name, ta, 90,
+                seed_amounts=seed,
+                family_config=family,
+                career_config=career,
+                social_security_config=social_security,
+                allow_home_purchase=buy_home,
+                life_expectancy=life_exp,
+                current_age=current_age,
+            )
             row[f'Age {ta}'] = f"${tc/1000:.0f}K"
         data.append(row)
     return data
@@ -1178,24 +1312,29 @@ if table_mode == "Baseline (Static)":
     baseline_kid_ages = (31, 33)
     baseline_spouse_works = True
     baseline_spouse_salary = 80000
+    baseline_spouse_soft_cap = 150000
     baseline_part_time_fraction = 0.5
 
     with st.spinner("Computing baseline minimum TC table..."):
         min_tc_data = compute_min_tc_table(
             baseline_seed_taxable, baseline_seed_401k, baseline_seed_roth, baseline_seed_hsa,
             baseline_marriage_age, baseline_kid_ages, baseline_spouse_works,
-            baseline_spouse_salary, baseline_part_time_fraction,
-            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+            baseline_spouse_salary, baseline_spouse_soft_cap, baseline_part_time_fraction,
+            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+            ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+            ss_inflation_indexed, ss_effective_tax_rate, buy_home, life_expectancy, start_age
         )
-    st.caption("Baseline: $0 starting seed, married at 29, 2 kids (ages 31, 33), spouse works ($80K, 50% part-time after kids)")
+    st.caption("Baseline: $0 seed, married at 29, 2 kids (31/33), spouse works ($80K, 50% part-time), with your current retirement/SS/home settings.")
 else:
     # Use current user settings
     if st.button("Calculate with Your Settings", type="primary"):
         with st.spinner("Computing personalized minimum TC table..."):
             min_tc_data = compute_min_tc_table(
                 seed_taxable, seed_401k, seed_roth, seed_hsa,
-                marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+                marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction,
+                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+                ss_enabled, ss_claim_age, ss_annual_benefit, ss_include_spouse, ss_spouse_benefit,
+                ss_inflation_indexed, ss_effective_tax_rate, buy_home, life_expectancy, start_age
             )
             st.session_state.personalized_table = min_tc_data
 
