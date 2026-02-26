@@ -71,6 +71,20 @@ with st.sidebar:
             help="Salary growth tapers as you approach this ceiling (most ICs plateau $500-700k)"
         )
 
+        st.subheader("401(k) Employer Match")
+        employer_match_pct = st.slider(
+            "Match Rate (%)",
+            min_value=0, max_value=100, value=50, step=5,
+            format="%d%%",
+            help="Employer contributes this % of your contribution (e.g. 50% = 50¢ per $1 you contribute)"
+        ) / 100.0
+        employer_match_limit = st.slider(
+            "Match Limit (% of salary)",
+            min_value=0, max_value=15, value=6, step=1,
+            format="%d%%",
+            help="Employer matches up to this % of your salary (e.g. 6% = match on first 6% you contribute)"
+        ) / 100.0
+
         st.caption(f"""
         **{career_trajectory.title()} trajectory:**
         - {'High' if career_trajectory == 'aggressive' else 'Moderate' if career_trajectory == 'moderate' else 'Lower'} promotion probability
@@ -150,14 +164,15 @@ family_config = FamilyConfig(
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
-            career_trajectory, tc_soft_cap, current_age):
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
         spouse_salary=spouse_salary, spouse_soft_cap=spouse_soft_cap, part_time_fraction=part_time_fraction
     )
     career = CareerConfig(
-        soft_cap=tc_soft_cap, trajectory=career_trajectory
+        soft_cap=tc_soft_cap, trajectory=career_trajectory,
+        employer_match_pct=employer_match_pct, employer_match_limit=employer_match_limit
     )
     rng = np.random.default_rng(42)
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
@@ -169,7 +184,7 @@ with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, start_age
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age
     )
 
 # =============================================================================
@@ -984,12 +999,13 @@ with tab8:
 
     # Also run comparison with zero seed
     @st.cache_data
-    def run_comparison_sim(starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp, career_traj, soft_cap):
+    def run_comparison_sim(starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp, career_traj, soft_cap, emp_match_pct, emp_match_limit):
         family = FamilyConfig(
             marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
             spouse_salary=spouse_salary, part_time_fraction=part_time_fraction
         )
-        career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj)
+        career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
+                             employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
         rng = np.random.default_rng(42)
         fire_ages, _, _ = run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=SeedAmounts(),
                               family_config=family, career_config=career,
@@ -998,7 +1014,7 @@ with tab8:
 
     zero_seed_ages = run_comparison_sim(
         starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
     )
     cdf_zero = [(zero_seed_ages <= age).mean() * 100 for age in ages_range]
 
@@ -1039,7 +1055,7 @@ with tab9:
         @st.cache_data
         def run_sensitivity(base_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
                            marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                           career_traj, soft_cap):
+                           career_traj, soft_cap, emp_match_pct, emp_match_limit):
             results = {}
             base_params = {
                 'starting_tc': base_tc,
@@ -1065,7 +1081,8 @@ with tab9:
                         spouse_salary=val if param == 'spouse_salary' else spouse_salary,
                         part_time_fraction=part_time_fraction
                     )
-                    career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj)
+                    career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
+                                         employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
                     tc = val if param == 'starting_tc' else base_tc
                     rng = np.random.default_rng(42)
                     fire_ages, _, _ = run_vectorized(tc, city, n_sims, rng, seed_amounts=seed,
@@ -1081,7 +1098,7 @@ with tab9:
         sensitivity = run_sensitivity(
             starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-            career_trajectory, tc_soft_cap
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
         )
 
         params = []
@@ -1135,14 +1152,15 @@ table_mode = st.radio(
 @st.cache_data
 def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
                          marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                         city_names, career_traj, soft_cap):
+                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit):
     ages_to_check = [40, 42, 44, 46, 48, 50, 52, 55]
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
         spouse_salary=spouse_salary, part_time_fraction=part_time_fraction
     )
-    career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj)
+    career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
+                         employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
 
     data = []
     for city_name in city_names:
@@ -1167,7 +1185,7 @@ if table_mode == "Baseline (Static)":
             baseline_seed_taxable, baseline_seed_401k, baseline_seed_roth, baseline_seed_hsa,
             baseline_marriage_age, baseline_kid_ages, baseline_spouse_works,
             baseline_spouse_salary, baseline_part_time_fraction,
-            tuple(all_cities.keys()), career_trajectory, tc_soft_cap
+            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
         )
     st.caption("Baseline: $0 starting seed, married at 29, 2 kids (ages 31, 33), spouse works ($80K, 50% part-time after kids)")
 else:
@@ -1177,7 +1195,7 @@ else:
             min_tc_data = compute_min_tc_table(
                 seed_taxable, seed_401k, seed_roth, seed_hsa,
                 marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                tuple(all_cities.keys()), career_trajectory, tc_soft_cap
+                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
             )
             st.session_state.personalized_table = min_tc_data
 
