@@ -295,7 +295,8 @@ def simulate_career_growth(
     n_sims: int,
     n_years: int,
     rng: np.random.Generator,
-    career_config: CareerConfig = None
+    career_config: CareerConfig = None,
+    current_age: int = None
 ) -> np.ndarray:
     """
     Simulate TC trajectories with stochastic promotions and soft cap.
@@ -310,6 +311,8 @@ def simulate_career_growth(
     """
     if career_config is None:
         career_config = CareerConfig()
+    if current_age is None:
+        current_age = CURRENT_AGE
 
     cfg = career_config
     trajectory = cfg.trajectory
@@ -471,7 +474,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     hs_roll = rng.random(size=(n_years, N))
 
     # Generate stochastic income trajectories using new career model
-    incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config)
+    incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config, current_age=current_age)
 
     # Add spouse income based on family config
     for i, age in enumerate(range(current_age, FIRE_HORIZON + 1)):
@@ -513,7 +516,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             st = cfg.state_tax_rate; disc = 35000*inf*np.ones(N)
             housing = cfg.family_rent*12*inf*np.ones(N)
             if has_home and age == 33:
-                pp = cfg.home_price*infl[ye-8]; down = pp*cfg.down_payment_pct
+                pp = cfg.home_price*infl[ye]; down = pp*cfg.down_payment_pct
                 mortgage[:] = pp-down; taxable -= down; owns_home[:] = True; home_val[:] = pp
                 r_m = cfg.mortgage_rate/12
                 fixed_pmt[:] = mortgage*r_m*(1+r_m)**360/((1+r_m)**360-1)
@@ -650,8 +653,8 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
                 rh = cfg.family_rent*12*inf + cfg.utility_premium*inf
             rd = 45000*inf; rhc = 24000*inf + HEALTH_SHOCK_PROB*HEALTH_SHOCK_COST*inf
             r529 = np.zeros(N)
-            if age < kid1_college: r529 += contrib_per_kid*inf
-            if age < kid2_college: r529 += contrib_per_kid*inf
+            if kid1_born <= age < kid1_college: r529 += contrib_per_kid*inf
+            if kid2_born <= age < kid2_college: r529 += contrib_per_kid*inf
             rt = rh + rd + rhc + r529 + kids
             # Dynamic SWR based on how long money needs to last
             swr = calc_swr(age, life_expectancy)
