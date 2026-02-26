@@ -189,7 +189,7 @@ class FamilyConfig:
     # Spouse work pattern
     spouse_works: bool = True             # Easy toggle to disable spouse income entirely
     spouse_salary: float = 80000          # Base full-time salary at marriage
-    spouse_salary_growth: float = 0.03    # Annual growth rate
+    spouse_salary_growth: float = 0.01    # Real (above-inflation) annual growth rate; infl[i] is applied at call-site
     spouse_soft_cap: float = 150000       # Salary ceiling (growth tapers near this, like main earner)
     part_time_fraction: float = 0.5       # Part-time as fraction of full-time
 
@@ -247,9 +247,15 @@ def calc_spouse_income(age: int, cfg: FamilyConfig, inflation: float, noise: flo
     - 1yr before first kid → last kid turns 5: $0 (child-rearing gap)
     - Last kid turns 5 onward: Part-time permanently
 
-    Salary growth is capped similar to main earner:
-    - Below 60% of cap: full growth
-    - 60-100% of cap: tapered growth
+    ``cfg.spouse_salary`` is the base salary expressed in today's (year-0) dollars.
+    ``cfg.spouse_salary_growth`` is a *real* (above-inflation) annual growth rate; the
+    loop accumulates only real purchasing-power growth.  The caller passes the cumulative
+    inflation multiplier ``infl[i]`` as ``inflation`` so that the result is in nominal
+    year-i dollars — inflation is applied exactly once.
+
+    Soft-cap tapering mirrors the main earner (both base and cap are in real/today's dollars):
+    - Below 60% of cap: full real growth
+    - 60-100% of cap: tapered growth (linear decay to ~30% of normal)
     - Above cap: capped at ceiling
     """
     if not cfg.spouse_works or age < cfg.marriage_age:
@@ -531,6 +537,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     ret_base_spend = np.zeros(N)
     fire_swr = np.full(N, SWR_DEFAULT)  # Track SWR at FIRE time for each simulation
     has_home = cfg.home_price is not None
+    home_purchase_age = np.zeros(N, dtype=int)  # Age when each sim buys; 0 = never bought
 
     # Track portfolio failures (ran out of money before life expectancy)
     failed = np.zeros(N, dtype=bool)
@@ -538,9 +545,10 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
     for i, age in enumerate(range(current_age, life_expectancy + 1)):
         ye = age - current_age; inf = infl[ye]; mr = mr_arr[i]
-        # Income is zero after FIRE or after FIRE_HORIZON (forced retirement)
-        working_years_idx = min(i, FIRE_HORIZON - current_age)
-        year_inc = np.where(fired | (age > FIRE_HORIZON), 0.0, incomes[working_years_idx])
+        just_bought = np.zeros(N, dtype=bool)
+        # Income is zero after FIRE or after FIRE_HORIZON (forced retirement).
+        # incomes has n_years rows so indexing with i is always in-bounds.
+        year_inc = np.where(fired | (age > FIRE_HORIZON), 0.0, incomes[i])
 
         if age < 28:
             housing = cfg.one_br_rent*12*inf*np.ones(N); disc = 30000*inf*np.ones(N); st = 0.055
@@ -549,25 +557,29 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         else:
             st = cfg.state_tax_rate; disc = 35000*inf*np.ones(N)
             housing = cfg.family_rent*12*inf*np.ones(N)
-            if has_home and age == 33:
-                pp = cfg.home_price*infl[ye]; down = pp*cfg.down_payment_pct
-                # Only buy if sufficient funds for down payment - otherwise rent forever
-                can_afford = taxable >= down
-                mortgage = np.where(can_afford, pp - down, mortgage)
-                taxable = np.where(can_afford, taxable - down, taxable)
-                owns_home = can_afford
-                home_val = np.where(can_afford, pp, home_val)
-                r_m = cfg.mortgage_rate/12
-                pmt = mortgage*r_m*(1+r_m)**360/((1+r_m)**360-1)
-                fixed_pmt = np.where(can_afford, pmt, fixed_pmt)
 
         ca_prem = np.zeros(N); utility = cfg.utility_premium*inf if age >= 31 else 0
         if has_home and age >= 33:
+            # Each year, simulations that haven't bought yet attempt to buy.
+            # They succeed as soon as taxable savings cover the down payment.
+            can_try = ~owns_home & ~fired
+            pp = cfg.home_price * infl[ye]; down = pp * cfg.down_payment_pct
+            just_bought = can_try & (taxable >= down)
+            mortgage = np.where(just_bought, pp - down, mortgage)
+            taxable = np.where(just_bought, taxable - down, taxable)
+            owns_home = owns_home | just_bought
+            home_val = np.where(just_bought, pp, home_val)
+            home_purchase_age = np.where(just_bought, age, home_purchase_age)
+            r_m = cfg.mortgage_rate / 12
+            new_pmt = (pp - down) * r_m * (1 + r_m)**360 / ((1 + r_m)**360 - 1)
+            fixed_pmt = np.where(just_bought, new_pmt, fixed_pmt)
+
             home_val = np.where(owns_home, home_val*(1+cfg.home_appreciation), home_val)
             ann_m = fixed_pmt*12; interest = mortgage*cfg.mortgage_rate
             mortgage = np.maximum(mortgage - np.maximum(np.minimum(ann_m-interest, mortgage), 0), 0)
             pm = home_val*(cfg.property_tax_rate+cfg.home_maintenance_pct)
-            ca_prem = np.where(owns_home, cfg.insurance_premium*((1+cfg.insurance_inflation)**(age-33)), 0)
+            years_owned = np.where(owns_home, age - home_purchase_age, 0)
+            ca_prem = np.where(owns_home, cfg.insurance_premium*((1+cfg.insurance_inflation)**years_owned), 0)
             housing = np.where(owns_home, np.where(mortgage > 0, ann_m+pm, pm), housing)
         housing += utility + ca_prem
 
@@ -615,7 +627,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         ot = np.zeros(N)
         if age == 28: ot += 40000*inf
         if age == 31: ot += 15000*inf
-        if age == 33 and has_home: ot += 25000*inf
+        if has_home: ot += np.where(just_bought, 25000*inf, 0)  # closing costs on purchase year
         if age == 30: ot += 35000*inf
         if age == 38: ot += 40000*inf
 
@@ -710,9 +722,13 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         # Check for FIRE eligibility only during working years (up to FIRE_HORIZON)
         if 30 <= age <= FIRE_HORIZON:
             if has_home and age >= 33:
-                rh = home_val*(cfg.property_tax_rate+cfg.home_maintenance_pct)
-                rh += cfg.insurance_premium*((1+cfg.insurance_inflation)**(age-33))
-                rh += cfg.utility_premium*inf
+                # Vary by ownership status per sim: owners pay property costs, renters pay rent
+                years_owned_fire = np.where(owns_home, age - home_purchase_age, 0)
+                rh_own = home_val*(cfg.property_tax_rate+cfg.home_maintenance_pct)
+                rh_own += cfg.insurance_premium*((1+cfg.insurance_inflation)**years_owned_fire)
+                rh_own += cfg.utility_premium*inf
+                rh_rent = cfg.family_rent*12*inf + cfg.utility_premium*inf
+                rh = np.where(owns_home, rh_own, rh_rent)
             else:
                 rh = cfg.family_rent*12*inf + cfg.utility_premium*inf
             rd = 45000*inf; rhc = 24000*inf + HEALTH_SHOCK_PROB*HEALTH_SHOCK_COST*inf
