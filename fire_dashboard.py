@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from datetime import date
 
 from fire import (
-    run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SimulationResults,
+    run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SocialSecurityConfig, SimulationResults,
     CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
 )
 
@@ -142,6 +142,34 @@ with st.sidebar:
             help="Simulation runs through this age to check if portfolio survives"
         )
 
+    with st.expander("Social Security", expanded=False):
+        ss_enabled = st.toggle("Enable Social Security", value=False)
+        if ss_enabled:
+            ss_claim_age = st.slider("Your claim age", min_value=62, max_value=70, value=67, step=1)
+            ss_fra_age = st.slider("Full retirement age (FRA)", min_value=66, max_value=67, value=67, step=1)
+            ss_annual_at_fra = st.number_input(
+                "Your annual benefit at FRA (today's $)",
+                min_value=0, max_value=150000, value=30000, step=1000,
+                help="Used as the baseline benefit; model applies early/late claiming adjustments and inflation COLA."
+            )
+            ss_spouse_enabled = st.toggle("Include spouse Social Security", value=False)
+            if ss_spouse_enabled:
+                ss_spouse_claim_age = st.slider("Spouse claim age", min_value=62, max_value=70, value=67, step=1)
+                ss_spouse_annual_at_fra = st.number_input(
+                    "Spouse annual benefit at FRA (today's $)",
+                    min_value=0, max_value=150000, value=20000, step=1000
+                )
+            else:
+                ss_spouse_claim_age = 67
+                ss_spouse_annual_at_fra = 0
+        else:
+            ss_claim_age = 67
+            ss_fra_age = 67
+            ss_annual_at_fra = 0
+            ss_spouse_enabled = False
+            ss_spouse_claim_age = 67
+            ss_spouse_annual_at_fra = 0
+
 # =============================================================================
 # RUN SIMULATION
 # =============================================================================
@@ -164,7 +192,8 @@ family_config = FamilyConfig(
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age):
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age,
+            ss_enabled, ss_claim_age, ss_fra_age, ss_annual_at_fra, ss_spouse_enabled, ss_spouse_claim_age, ss_spouse_annual_at_fra):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -174,9 +203,19 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
         soft_cap=tc_soft_cap, trajectory=career_trajectory,
         employer_match_pct=employer_match_pct, employer_match_limit=employer_match_limit
     )
+    ss_cfg = SocialSecurityConfig(
+        enabled=ss_enabled,
+        claim_age=ss_claim_age,
+        full_retirement_age=ss_fra_age,
+        annual_benefit_at_fra=ss_annual_at_fra,
+        spouse_enabled=ss_spouse_enabled,
+        spouse_claim_age=ss_spouse_claim_age,
+        spouse_annual_benefit_at_fra=ss_spouse_annual_at_fra,
+    )
     rng = np.random.default_rng(42)
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
                           family_config=family, career_config=career,
+                          social_security_config=ss_cfg,
                           return_trajectories=True, life_expectancy=life_exp,
                           current_age=current_age)
 
@@ -184,7 +223,8 @@ with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age,
+        ss_enabled, ss_claim_age, ss_fra_age, ss_annual_at_fra, ss_spouse_enabled, ss_spouse_claim_age, ss_spouse_annual_at_fra
     )
 
 # =============================================================================
