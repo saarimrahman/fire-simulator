@@ -218,6 +218,10 @@ class CareerConfig:
     # Promotion raise ranges (min, max) as multipliers
     promo_raise_range: tuple = (1.12, 1.20)  # 12-20% raise per promotion
 
+    # 401k employer match
+    employer_match_pct: float = 0.50      # 50% match (common default)
+    employer_match_limit: float = 0.06    # Match up to 6% of salary
+
 
 # Cumulative promotion probabilities by trajectory
 # Format: {trajectory: [promo1_prob, promo2_prob, promo3_prob, promo4_prob]}
@@ -496,6 +500,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     owns_home = np.zeros(N, dtype=bool); fired = np.zeros(N, dtype=bool)
     fire_ages = np.full(N, 99, dtype=int); fixed_pmt = np.zeros(N)
     ret_base_spend = np.zeros(N)
+    fire_swr = np.full(N, SWR_DEFAULT)  # Track SWR at FIRE time for each simulation
     has_home = cfg.home_price is not None
 
     # Track portfolio failures (ran out of money before life expectancy)
@@ -517,9 +522,15 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             housing = cfg.family_rent*12*inf*np.ones(N)
             if has_home and age == 33:
                 pp = cfg.home_price*infl[ye]; down = pp*cfg.down_payment_pct
-                mortgage[:] = pp-down; taxable -= down; owns_home[:] = True; home_val[:] = pp
+                # Only buy if sufficient funds for down payment - otherwise rent forever
+                can_afford = taxable >= down
+                mortgage = np.where(can_afford, pp - down, mortgage)
+                taxable = np.where(can_afford, taxable - down, taxable)
+                owns_home = can_afford
+                home_val = np.where(can_afford, pp, home_val)
                 r_m = cfg.mortgage_rate/12
-                fixed_pmt[:] = mortgage*r_m*(1+r_m)**360/((1+r_m)**360-1)
+                pmt = mortgage*r_m*(1+r_m)**360/((1+r_m)**360-1)
+                fixed_pmt = np.where(can_afford, pmt, fixed_pmt)
 
         ca_prem = np.zeros(N); utility = cfg.utility_premium*inf if age >= 31 else 0
         if has_home and age >= 33:
@@ -531,15 +542,31 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             housing = np.where(owns_home, np.where(mortgage > 0, ann_m+pm, pm), housing)
         housing += utility + ca_prem
 
+        # Calculate kid costs based on each kid's age with realistic scaling
         kids = np.zeros(N)
         kid_cost = family_config.annual_cost_per_kid
-        if age >= kid1_born: kids += kid_cost*inf
-        if age >= kid2_born: kids += kid_cost*inf
-        if age >= 36: kids *= 1.5
-        # Kids leave home at 22 (college graduation)
-        if kid1_born < 999 and age >= kid1_born + 22: kids -= kid_cost*inf*1.5
-        if kid2_born < 999 and age >= kid2_born + 22: kids -= kid_cost*inf*1.5
-        kids = np.maximum(kids, 0)
+        for kid_born in [kid1_born, kid2_born]:
+            if kid_born >= 999:
+                continue
+            kid_age = age - kid_born
+            if kid_age < 0 or kid_age >= 22:
+                continue  # Not born yet or left home
+
+            # Realistic cost scaling by kid's age (USDA data patterns):
+            # - Ages 0-5: baseline (childcare heavy but smaller consumption)
+            # - Ages 6-12: 1.2x (school activities, food, clothes)
+            # - Ages 13-17: 1.5x (teens eat more, activities, driving)
+            # - Ages 18-21: 1.3x (if still at home, less childcare but other costs)
+            if kid_age >= 18:
+                cost_mult = 1.3
+            elif kid_age >= 13:
+                cost_mult = 1.5
+            elif kid_age >= 6:
+                cost_mult = 1.2
+            else:
+                cost_mult = 1.0
+
+            kids += kid_cost * inf * cost_mult
 
         c529c = np.zeros(N)
         college_annual = family_config.college_cost_per_kid / COLLEGE_YEARS
@@ -577,14 +604,20 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         a401 = np.where(wp, np.minimum(t401k_c, net_inc*0.5), 0)
         ar = np.where(wp, np.minimum(ROTH_IRA_LIMIT*inf, net_inc*0.3), 0)
         ah = np.where(wp, np.minimum(hsa_c, net_inc*0.2), 0)
-        t401k += a401; roth += ar; roth_basis += ar; hsa_bal += ah
+        # Calculate employer 401k match (free money, not from net_inc)
+        matchable_salary = year_inc * career_config.employer_match_limit
+        matchable = np.minimum(matchable_salary, a401)
+        employer_match = np.where(wp, matchable * career_config.employer_match_pct, 0)
+        t401k += a401 + employer_match; roth += ar; roth_basis += ar; hsa_bal += ah
         taxable += np.where(wp, net_inc-a401-ar-ah, 0)
         taxable += np.where((~fired)&(net_inc<=0), net_inc, 0)
 
         total_port = taxable + t401k + roth + hsa_bal
         ret_base_spend = np.where(fired & (ret_base_spend==0), total_spend, ret_base_spend)
         wd_rate = np.where(fired & (total_port > 0), ret_base_spend/total_port, 0)
-        adj = np.where(wd_rate > 0.05, 0.90, np.where(wd_rate < 0.03, 1.10, 1+INFLATION))
+        # Use fire_swr (SWR at retirement) for withdrawal rate bounds instead of hardcoded values
+        adj = np.where(wd_rate > fire_swr * 1.25, 0.90,  # 25% above target SWR: cut spending
+                       np.where(wd_rate < fire_swr * 0.75, 1.10, 1+INFLATION))  # 25% below: increase
         ret_base_spend = np.where(fired, ret_base_spend*adj, ret_base_spend)
 
         if age < 60:
@@ -662,6 +695,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             bridge = rt * max(0, 60-age)
             can_fire = (~fired) & (total_liq >= fn) & (accessible >= bridge)
             fire_ages = np.where(can_fire, age, fire_ages)
+            fire_swr = np.where(can_fire, swr, fire_swr)  # Store SWR at FIRE time
             fired = fired | can_fire
             ret_base_spend = np.where(can_fire, rt, ret_base_spend)
 
