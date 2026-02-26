@@ -9,8 +9,8 @@ import plotly.graph_objects as go
 from datetime import date
 
 from fire import (
-    run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SimulationResults,
-    CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
+    run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SocialSecurityConfig,
+    SimulationResults, CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
 )
 
 st.set_page_config(page_title="FIRE Simulator", page_icon="🔥", layout="wide")
@@ -135,6 +135,47 @@ with st.sidebar:
                              disabled=cfg.home_price is None,
                              help="Not available in SF (no home price configured)")
 
+    with st.expander("Social Security", expanded=False):
+        ss_enabled = st.toggle("Include Social Security", value=True,
+                               help="Model Social Security benefits starting at claiming age")
+
+        if ss_enabled:
+            ss_claiming_age = st.slider(
+                "Your Claiming Age", min_value=62, max_value=70, value=67,
+                help="FRA is 67. Earlier = reduced benefits (~6.7%/yr). Later = increased (~8%/yr)."
+            )
+            ss_monthly = st.slider(
+                "Your Monthly Benefit at FRA ($)",
+                min_value=0, max_value=5000, value=2500, step=100,
+                format="$%d",
+                help="Estimated monthly benefit at full retirement age (67). Check ssa.gov/myaccount."
+            )
+            ss_spouse_monthly = st.slider(
+                "Spouse Monthly Benefit at FRA ($)",
+                min_value=0, max_value=5000, value=1250, step=100,
+                format="$%d",
+                help="Spouse benefit (often 50% of primary earner's benefit)"
+            )
+            ss_spouse_claiming = st.slider(
+                "Spouse Claiming Age", min_value=62, max_value=70, value=67
+            )
+
+            # Show estimated annual benefits
+            ss_temp = SocialSecurityConfig(
+                claiming_age=ss_claiming_age,
+                monthly_benefit_today=ss_monthly,
+                spouse_monthly_benefit=ss_spouse_monthly,
+                spouse_claiming_age=ss_spouse_claiming
+            )
+            primary_annual = ss_temp.get_benefit_at_age(ss_claiming_age)
+            spouse_annual = ss_temp.get_spouse_benefit_at_age(ss_spouse_claiming)
+            st.caption(f"Estimated annual: **${primary_annual:,.0f}** (you) + **${spouse_annual:,.0f}** (spouse) = **${primary_annual + spouse_annual:,.0f}** total")
+        else:
+            ss_claiming_age = 67
+            ss_monthly = 2500
+            ss_spouse_monthly = 1250
+            ss_spouse_claiming = 67
+
     with st.expander("Retirement Planning", expanded=False):
         life_expectancy = st.slider(
             "Life Expectancy",
@@ -164,7 +205,8 @@ family_config = FamilyConfig(
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age):
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age,
+            ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -174,9 +216,14 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
         soft_cap=tc_soft_cap, trajectory=career_trajectory,
         employer_match_pct=employer_match_pct, employer_match_limit=employer_match_limit
     )
+    ss = SocialSecurityConfig(
+        enabled=ss_enabled, claiming_age=ss_claiming_age,
+        monthly_benefit_today=ss_monthly, spouse_monthly_benefit=ss_spouse_monthly,
+        spouse_claiming_age=ss_spouse_claiming
+    )
     rng = np.random.default_rng(42)
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
-                          family_config=family, career_config=career,
+                          family_config=family, career_config=career, ss_config=ss,
                           return_trajectories=True, life_expectancy=life_exp,
                           current_age=current_age)
 
@@ -184,31 +231,37 @@ with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age,
+        ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
     )
 
 # =============================================================================
 # KEY METRICS
 # =============================================================================
-fire_ages_valid = results.fire_ages[results.fire_ages < 99]
-pct_fire = len(fire_ages_valid) / len(results.fire_ages) * 100
-median_fire_age = np.median(fire_ages_valid) if len(fire_ages_valid) > 0 else None
-p10_fire_age = np.percentile(fire_ages_valid, 10) if len(fire_ages_valid) > 0 else None
-p90_fire_age = np.percentile(fire_ages_valid, 90) if len(fire_ages_valid) > 0 else None
+FIRE_HORIZON_AGE = 60  # Must match FIRE_HORIZON in fire.py
 
-# Success = FIRE'd AND portfolio survived to life expectancy
+# Voluntary FIRE = achieved FIRE before forced retirement at 60
+voluntary_fire = results.fire_ages[results.fire_ages < FIRE_HORIZON_AGE]
+all_retired = results.fire_ages[results.fire_ages < 99]
+fire_ages_valid = voluntary_fire  # For histograms and percentile calculations
+pct_fire = len(voluntary_fire) / len(results.fire_ages) * 100
+median_fire_age = np.median(voluntary_fire) if len(voluntary_fire) > 0 else None
+p10_fire_age = np.percentile(voluntary_fire, 10) if len(voluntary_fire) > 0 else None
+p90_fire_age = np.percentile(voluntary_fire, 90) if len(voluntary_fire) > 0 else None
+
+# Success = portfolio survived to life expectancy (everyone retires by 60)
 n_sims_total = len(results.fire_ages)
-n_fired = (results.fire_ages < 99).sum()
-n_survived = ((results.fire_ages < 99) & ~results.failed).sum()
+n_survived = (~results.failed).sum()
 pct_success = n_survived / n_sims_total * 100
-pct_failed_after_fire = (n_fired - n_survived) / max(n_fired, 1) * 100
+pct_failed = results.failed.mean() * 100
 
 col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
-    st.metric("FIRE Rate", f"{pct_fire:.1f}%", help="% of simulations that reached FIRE")
+    st.metric("FIRE Rate", f"{pct_fire:.1f}%",
+              help="% of simulations that achieved voluntary FIRE before age 60")
 with col2:
     st.metric("Success Rate", f"{pct_success:.1f}%",
-              help=f"FIRE'd AND portfolio survived to age {life_expectancy}")
+              help=f"Portfolio survived to age {life_expectancy} (everyone retires at 60)")
 with col3:
     st.metric("Median FIRE Age", f"{median_fire_age:.0f}" if median_fire_age else "N/A")
 with col4:
@@ -216,23 +269,24 @@ with col4:
 with col5:
     st.metric("P90 FIRE Age", f"{p90_fire_age:.0f}" if p90_fire_age else "N/A")
 
-if pct_failed_after_fire > 0:
-    st.warning(f"⚠️ {pct_failed_after_fire:.1f}% of FIRE'd simulations ran out of money before age {life_expectancy}")
+if pct_failed > 0:
+    st.warning(f"⚠️ {pct_failed:.1f}% of simulations ran out of money before age {life_expectancy}")
     with st.expander("Why do some simulations fail?"):
         st.markdown(f"""
-        **This small failure rate ({pct_failed_after_fire:.1f}%) is actually expected and realistic!**
+        **{pct_failed:.1f}% of simulations depleted their portfolio before age {life_expectancy}.**
 
-        Even though the simulation uses dynamic, conservative safe withdrawal rates (SWR) based on retirement length:
-        - Someone FIREing at 40 with 50 years left uses ~2.5% SWR (very conservative)
-        - Someone FIREing at 50 with 40 years left uses ~3.1% SWR
+        All simulations retire by age 60 (voluntarily or forced). Failures can happen because:
 
-        **Failures occur due to:**
-        1. **Sequence of Returns Risk**: Hitting multiple bad market years early in retirement
-        2. **Barely Meeting FIRE**: Portfolios right at the threshold have less buffer
-        3. **Spending Adjustments Lag**: The 10% spending cuts when withdrawal rate > 5% may not be enough in extreme scenarios
+        1. **Insufficient Savings**: Some paths don't accumulate enough by retirement
+        2. **Sequence of Returns Risk**: Bad market years early in retirement
+        3. **Inflation Spikes**: High inflation periods erode purchasing power
+        4. **Health Shocks**: Unexpected medical costs
 
-        This {pct_failed_after_fire:.1f}% failure rate shows the simulation is capturing realistic tail risk.
-        In practice, you'd have additional levers like Social Security, downsizing, part-time work, etc.
+        **To improve success rate:**
+        - Increase starting TC or savings rate
+        - Enable Social Security benefits (sidebar)
+        - Consider a less expensive city
+        - Adjust career trajectory to aggressive
         """)
 
 # =============================================================================
@@ -357,10 +411,10 @@ with tab2:
                      int(median_fire_age) if median_fire_age else 45)
     }
 
-    start_age, end_age = stage_ranges[life_stage]
+    stage_start, stage_end = stage_ranges[life_stage]
 
     # Get indices for the age range
-    age_mask = (results.ages >= start_age) & (results.ages <= end_age)
+    age_mask = (results.ages >= stage_start) & (results.ages <= stage_end)
     age_indices = np.where(age_mask)[0]
 
     if len(age_indices) > 0:
@@ -459,7 +513,7 @@ with tab2:
         )])
 
         fig.update_layout(
-            title=f"Median Annual Cash Flow (Age {start_age}-{end_age})",
+            title=f"Median Annual Cash Flow (Age {stage_start}-{stage_end})",
             font_size=12,
             height=600
         )
@@ -560,8 +614,8 @@ with tab3:
         stage_data = {cat: [] for cat in categories}
         stage_names = []
 
-        for stage_name, (start_age, end_age) in stages.items():
-            age_mask = (results.ages >= start_age) & (results.ages <= end_age)
+        for stage_name, (s_start, s_end) in stages.items():
+            age_mask = (results.ages >= s_start) & (results.ages <= s_end)
             age_indices = np.where(age_mask)[0]
 
             if len(age_indices) > 0:
@@ -615,7 +669,7 @@ with tab6:
         fig.add_vline(x=median_fire_age, line_dash="dash", line_color="red",
                       annotation_text=f"Median: {median_fire_age:.0f}")
 
-    never_fire_pct = 100 - pct_fire
+    never_fire_pct = 100 - pct_fire  # % that didn't achieve voluntary FIRE before 60
     fig.update_layout(
         xaxis_title="FIRE Age",
         yaxis_title="Count",
@@ -952,31 +1006,43 @@ with tab5:
 
     ages = results.ages
     income_med = np.median(results.incomes, axis=1)
+    ss_income_med = np.median(results.ss_income, axis=1)
+    total_income_med = income_med + ss_income_med
     spending_med = np.median(results.spending, axis=1)
 
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
         x=ages, y=income_med,
-        mode='lines', name='Household Income',
-        line=dict(color='#00CC96', width=2)
+        mode='lines', name='Earned Income',
+        line=dict(color='#00CC96', width=2),
+        hovertemplate='Earned: $%{y:,.0f}<extra></extra>'
     ))
+
+    if ss_income_med.max() > 0:
+        fig.add_trace(go.Scatter(
+            x=ages, y=total_income_med,
+            mode='lines', name='Total Income (+ SS)',
+            line=dict(color='#636EFA', width=2, dash='dot'),
+            hovertemplate='Total (incl. SS): $%{y:,.0f}<extra></extra>'
+        ))
+
     fig.add_trace(go.Scatter(
         x=ages, y=spending_med,
         mode='lines', name='Total Spending',
-        line=dict(color='#EF553B', width=2)
+        line=dict(color='#EF553B', width=2),
+        hovertemplate='Spending: $%{y:,.0f}<extra></extra>'
     ))
 
-    # Fill the savings gap
+    # Fill the savings gap (use total income including SS)
     fig.add_trace(go.Scatter(
         x=np.concatenate([ages, ages[::-1]]),
-        y=np.concatenate([income_med, spending_med[::-1]]),
-        fill='toself', fillcolor='rgba(0, 204, 150, 0.2)',
+        y=np.concatenate([total_income_med, spending_med[::-1]]),
+        fill='toself', fillcolor='rgba(0, 204, 150, 0.15)',
         line=dict(color='rgba(255,255,255,0)'),
-        name='Savings', showlegend=True
+        name='Surplus / Deficit', showlegend=True
     ))
 
-    # Mark median FIRE age
     if median_fire_age:
         fig.add_vline(x=median_fire_age, line_dash="dash", line_color="green",
                       annotation_text=f"Median FIRE: {median_fire_age:.0f}")
@@ -994,27 +1060,34 @@ with tab5:
 with tab8:
     st.subheader("Cumulative FIRE Probability by Age")
 
-    ages_range = np.arange(start_age, FIRE_HORIZON + 1)
+    ages_range = np.arange(start_age, FIRE_HORIZON_AGE + 1)
     cdf = [(results.fire_ages <= age).mean() * 100 for age in ages_range]
 
     # Also run comparison with zero seed
     @st.cache_data
-    def run_comparison_sim(starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp, career_traj, soft_cap, emp_match_pct, emp_match_limit):
+    def run_comparison_sim(starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp, career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                           ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming):
         family = FamilyConfig(
             marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
             spouse_salary=spouse_salary, part_time_fraction=part_time_fraction
         )
         career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
                              employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
+        ss = SocialSecurityConfig(
+            enabled=ss_enabled, claiming_age=ss_claiming_age,
+            monthly_benefit_today=ss_monthly, spouse_monthly_benefit=ss_spouse_monthly,
+            spouse_claiming_age=ss_spouse_claiming
+        )
         rng = np.random.default_rng(42)
         fire_ages, _, _ = run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=SeedAmounts(),
-                              family_config=family, career_config=career,
+                              family_config=family, career_config=career, ss_config=ss,
                               return_trajectories=False, life_expectancy=life_exp)
         return fire_ages
 
     zero_seed_ages = run_comparison_sim(
         starting_tc, city, n_sims, marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+        ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
     )
     cdf_zero = [(zero_seed_ages <= age).mean() * 100 for age in ages_range]
 
@@ -1055,13 +1128,20 @@ with tab9:
         @st.cache_data
         def run_sensitivity(base_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
                            marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                           career_traj, soft_cap, emp_match_pct, emp_match_limit):
+                           career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                           ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming):
             results = {}
             base_params = {
                 'starting_tc': base_tc,
                 'seed_taxable': seed_taxable,
                 'spouse_salary': spouse_salary if spouse_works else 0,
             }
+
+            ss = SocialSecurityConfig(
+                enabled=ss_enabled, claiming_age=ss_claiming_age,
+                monthly_benefit_today=ss_monthly, spouse_monthly_benefit=ss_spouse_monthly,
+                spouse_claiming_age=ss_spouse_claiming
+            )
 
             for param, base_val in base_params.items():
                 if base_val == 0:
@@ -1087,18 +1167,19 @@ with tab9:
                     rng = np.random.default_rng(42)
                     fire_ages, _, _ = run_vectorized(tc, city, n_sims, rng, seed_amounts=seed,
                                               family_config=family, career_config=career,
-                                              return_trajectories=False)
+                                              ss_config=ss, return_trajectories=False)
                     valid = fire_ages[fire_ages < 99]
                     ages_list.append(np.median(valid) if len(valid) > 0 else 99)
 
-                results[param] = (ages_list[0], ages_list[1])  # (low_result, high_result)
+                results[param] = (ages_list[0], ages_list[1])
 
             return results
 
         sensitivity = run_sensitivity(
             starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+            ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
         )
 
         params = []
@@ -1152,7 +1233,8 @@ table_mode = st.radio(
 @st.cache_data
 def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
                          marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit):
+                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                         ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming):
     ages_to_check = [40, 42, 44, 46, 48, 50, 52, 55]
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
@@ -1161,12 +1243,18 @@ def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
     )
     career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
                          employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
+    ss = SocialSecurityConfig(
+        enabled=ss_enabled, claiming_age=ss_claiming_age,
+        monthly_benefit_today=ss_monthly, spouse_monthly_benefit=ss_spouse_monthly,
+        spouse_claiming_age=ss_spouse_claiming
+    )
 
     data = []
     for city_name in city_names:
         row = {'City': city_name}
         for ta in ages_to_check:
-            tc = find_min_tc(city_name, ta, 90, seed_amounts=seed, family_config=family, career_config=career)
+            tc = find_min_tc(city_name, ta, 90, seed_amounts=seed, family_config=family,
+                           career_config=career, ss_config=ss)
             row[f'Age {ta}'] = f"${tc/1000:.0f}K"
         data.append(row)
     return data
@@ -1185,7 +1273,8 @@ if table_mode == "Baseline (Static)":
             baseline_seed_taxable, baseline_seed_401k, baseline_seed_roth, baseline_seed_hsa,
             baseline_marriage_age, baseline_kid_ages, baseline_spouse_works,
             baseline_spouse_salary, baseline_part_time_fraction,
-            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+            ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
         )
     st.caption("Baseline: $0 starting seed, married at 29, 2 kids (ages 31, 33), spouse works ($80K, 50% part-time after kids)")
 else:
@@ -1195,7 +1284,8 @@ else:
             min_tc_data = compute_min_tc_table(
                 seed_taxable, seed_401k, seed_roth, seed_hsa,
                 marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+                ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
             )
             st.session_state.personalized_table = min_tc_data
 
