@@ -200,6 +200,39 @@ class FamilyConfig:
     college_cost_per_kid: float = 300000
     annual_cost_per_kid: float = 8000
 
+
+@dataclass
+class CareerConfig:
+    """Configuration for career/salary progression with stochastic promotions."""
+    soft_cap: float = 600_000             # TC ceiling (growth tapers near this)
+    trajectory: str = "moderate"          # "aggressive", "moderate", "conservative"
+
+    # Promotion windows: (start_age, end_age)
+    # Promotions happen stochastically within these windows
+    promo_1_window: tuple = (26, 29)      # First major promotion (mid-level → senior)
+    promo_2_window: tuple = (29, 33)      # Second major promotion (senior → staff)
+    promo_3_window: tuple = (33, 40)      # Third promotion (staff → senior staff)
+    promo_4_window: tuple = (40, 50)      # Fourth promotion (principal, rare)
+
+    # Promotion raise ranges (min, max) as multipliers
+    promo_raise_range: tuple = (1.12, 1.20)  # 12-20% raise per promotion
+
+
+# Cumulative promotion probabilities by trajectory
+# Format: {trajectory: [promo1_prob, promo2_prob, promo3_prob, promo4_prob]}
+PROMO_PROBABILITIES = {
+    "conservative": [0.80, 0.70, 0.40, 0.10],
+    "moderate":     [0.90, 0.85, 0.60, 0.25],
+    "aggressive":   [0.95, 0.92, 0.80, 0.45],
+}
+
+# Base annual real growth rates by trajectory (before inflation)
+BASE_GROWTH_RATES = {
+    "conservative": 0.01,   # 1% real + 3% inflation = 4% nominal
+    "moderate":     0.015,  # 1.5% real + 3% inflation = 4.5% nominal
+    "aggressive":   0.02,   # 2% real + 3% inflation = 5% nominal
+}
+
 def calc_spouse_income(age: int, cfg: FamilyConfig, inflation: float, noise: float = 1.0) -> float:
     """Calculate spouse income for a given age based on family configuration.
 
@@ -229,13 +262,116 @@ def calc_spouse_income(age: int, cfg: FamilyConfig, inflation: float, noise: flo
     salary = cfg.spouse_salary * ((1 + cfg.spouse_salary_growth) ** years_since_marriage)
     return salary * fraction * inflation * noise
 
+
+def simulate_career_growth(
+    starting_tc: float,
+    n_sims: int,
+    n_years: int,
+    rng: np.random.Generator,
+    career_config: CareerConfig = None
+) -> np.ndarray:
+    """
+    Simulate TC trajectories with stochastic promotions and soft cap.
+
+    Each simulation gets:
+    - Random promotion timing within windows
+    - Random promotion raise amounts (12-20%)
+    - Probability-based promotion occurrence
+    - Soft cap that tapers growth as TC approaches ceiling
+
+    Returns: (n_years, n_sims) array of TC values
+    """
+    if career_config is None:
+        career_config = CareerConfig()
+
+    cfg = career_config
+    trajectory = cfg.trajectory
+    soft_cap = cfg.soft_cap
+    base_growth = BASE_GROWTH_RATES.get(trajectory, 0.015)
+    promo_probs = PROMO_PROBABILITIES.get(trajectory, PROMO_PROBABILITIES["moderate"])
+
+    # Initialize TC array
+    tc = np.full(n_sims, starting_tc, dtype=float)
+    incomes = np.zeros((n_years, n_sims))
+
+    # Pre-generate promotion decisions for each simulation
+    # For each promo window, determine: (1) if promoted, (2) when, (3) raise amount
+    promo_windows = [cfg.promo_1_window, cfg.promo_2_window, cfg.promo_3_window, cfg.promo_4_window]
+
+    # Track which promotions each sim has received
+    promos_received = np.zeros((4, n_sims), dtype=bool)
+    promo_ages = np.full((4, n_sims), 999, dtype=int)  # Age when promotion happens
+    promo_raises = np.zeros((4, n_sims))  # Raise multiplier for each promo
+
+    for promo_idx, (window_start, window_end) in enumerate(promo_windows):
+        # Determine if each sim gets this promotion
+        will_promote = rng.random(n_sims) < promo_probs[promo_idx]
+
+        # For those who promote, pick a random age within the window
+        window_size = window_end - window_start + 1
+        promo_year_offset = rng.integers(0, window_size, size=n_sims)
+        promo_ages[promo_idx] = np.where(will_promote, window_start + promo_year_offset, 999)
+
+        # Random raise amount within range
+        raise_min, raise_max = cfg.promo_raise_range
+        promo_raises[promo_idx] = rng.uniform(raise_min, raise_max, size=n_sims)
+
+    # Annual noise for base growth
+    growth_noise = rng.normal(0, 0.015, size=(n_years, n_sims))
+
+    # Simulate year by year
+    for year_idx in range(n_years):
+        age = CURRENT_AGE + year_idx
+
+        # Store current TC
+        incomes[year_idx] = tc.copy()
+
+        # Stop growth after FIRE_HORIZON (they're retired)
+        if age >= FIRE_HORIZON:
+            continue
+
+        # Check for promotions this year
+        for promo_idx in range(4):
+            promoted_this_year = (promo_ages[promo_idx] == age) & ~promos_received[promo_idx]
+            tc = np.where(promoted_this_year, tc * promo_raises[promo_idx], tc)
+            promos_received[promo_idx] = promos_received[promo_idx] | promoted_this_year
+
+        # Apply growth with hard soft-cap
+        # The cap acts as a ceiling that salaries gravitate toward but rarely exceed long-term
+        cap_ratio = tc / soft_cap
+
+        # Growth rate depends on distance from cap:
+        # - Below 60% of cap: full growth (promotions + raises)
+        # - 60-100% of cap: growth tapers linearly to zero
+        # - Above cap: mean reversion back toward cap
+        growth_mult = np.where(
+            cap_ratio < 0.6,
+            # Below 60%: full growth
+            (1 + base_growth + growth_noise[year_idx]) * (1 + INFLATION),
+            np.where(
+                cap_ratio < 1.0,
+                # 60-100%: linear taper, minimal growth at cap
+                (1 + base_growth * (1 - cap_ratio) / 0.4 * 0.3 + growth_noise[year_idx] * 0.5) * (1 + INFLATION * 0.7),
+                # Above cap: mean reversion (slight decline toward cap)
+                1 + INFLATION * 0.3 - 0.02 * np.minimum(cap_ratio - 1.0, 0.5)
+            )
+        )
+
+        # Clamp to prevent extreme values
+        growth_mult = np.clip(growth_mult, 0.97, 1.08)
+
+        tc = tc * growth_mult
+
+    return incomes
+
 def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, family_config=None,
-                   return_trajectories=False, life_expectancy=None):
+                   career_config=None, return_trajectories=False, life_expectancy=None):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
         or {'taxable': 165000, '401k': 75000, 'roth': 45000, 'hsa': 15000}
     family_config: FamilyConfig dataclass for spouse/kid settings
+    career_config: CareerConfig dataclass for salary progression settings
     return_trajectories: if True, return SimulationResults with full trajectory data
     life_expectancy: age to simulate through (default: LIFE_EXPECTANCY constant)
     """
@@ -284,6 +420,9 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     if family_config is None:
         family_config = FamilyConfig()
 
+    if career_config is None:
+        career_config = CareerConfig()
+
     # Derive kid ages from config
     kid_ages = sorted(family_config.kid_ages) if family_config.kid_ages else []
     kid1_born = kid_ages[0] if len(kid_ages) >= 1 else 999
@@ -292,7 +431,6 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     kid2_college = kid2_born + 18
     contrib_per_kid = family_config.college_cost_per_kid * 0.06 / ((1.06)**18 - 1)
 
-    income_noise = rng.normal(0, 0.02, size=(n_years, N))
     spouse_noise = np.maximum(rng.normal(1.0, 0.1, size=(n_years, N)), 0.5)
     spouse_works_roll = rng.random(N) < 0.90  # 90% chance spouse works when in working period
     recession = rng.random(size=(n_years, N)) < 0.15
@@ -302,20 +440,15 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     jl_thresh = np.where(recession, 0.15, 0.03)
     hs_roll = rng.random(size=(n_years, N))
 
-    tc = np.full(N, starting_tc, dtype=float)
-    incomes = np.zeros((n_years, N))
-    # Build income trajectory up to FIRE_HORIZON (working years)
+    # Generate stochastic income trajectories using new career model
+    incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config)
+
+    # Add spouse income based on family config
     for i, age in enumerate(range(CURRENT_AGE, FIRE_HORIZON + 1)):
-        if age == 27: tc *= 1.15
-        elif age == 30: tc *= 1.20
-        elif age == 34: tc *= 1.10
-        elif age == 38: tc *= 1.10
-        if i > 0 and age not in [27, 30, 34, 38]:
-            tc *= np.maximum((1.01 + income_noise[i]) * (1 + INFLATION), 0.98)
-        incomes[i] = tc.copy()
-        # Add spouse income based on family config
         spouse_inc = calc_spouse_income(age, family_config, infl[i], noise=1.0)
         incomes[i] += spouse_inc * spouse_noise[i] * spouse_works_roll
+
+    # Apply job loss effects
     incomes = np.where(jl_roll < jl_thresh, incomes * 0.5, incomes)
 
     # SEEDED starting balances (explicit dollar amounts per account)
@@ -535,11 +668,12 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         )
     return fire_ages, failed, failure_ages
 
-def find_min_tc(city, target_age, conf_pct, seed_amounts=None, family_config=None, lo=100000, hi=700000, tol=5000):
+def find_min_tc(city, target_age, conf_pct, seed_amounts=None, family_config=None, career_config=None, lo=100000, hi=700000, tol=5000):
     while hi - lo > tol:
         mid = round((lo + hi) / 2 / 5000) * 5000
         rng = np.random.default_rng(42)
-        fire_ages, _, _ = run_vectorized(mid, city, N_SIMS, rng, seed_amounts=seed_amounts, family_config=family_config)
+        fire_ages, _, _ = run_vectorized(mid, city, N_SIMS, rng, seed_amounts=seed_amounts,
+                                          family_config=family_config, career_config=career_config)
         pct = (fire_ages <= target_age).mean() * 100
         if pct >= conf_pct:
             hi = mid
