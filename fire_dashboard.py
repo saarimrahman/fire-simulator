@@ -24,6 +24,14 @@ st.title("FIRE Simulation Dashboard")
 with st.sidebar:
     st.header("Simulation Settings")
 
+    start_age = st.slider("Current Age", min_value=18, max_value=40, value=25)
+
+    starting_tc = st.slider(
+        "Starting Total Compensation ($)",
+        min_value=100000, max_value=500000, value=200000, step=10000,
+        format="$%d"
+    )
+
     n_sims = st.select_slider(
         "Number of Simulations",
         options=[1000, 2500, 5000, 10000, 20000, 50000],
@@ -42,13 +50,6 @@ with st.sidebar:
     all_cities = {**CITIES, **st.session_state.custom_cities}
 
     city = st.selectbox("City", list(all_cities.keys()), index=0)
-
-    st.subheader("Income")
-    starting_tc = st.slider(
-        "Starting Total Compensation ($)",
-        min_value=100000, max_value=500000, value=200000, step=10000,
-        format="$%d"
-    )
 
     with st.expander("Career Progression", expanded=False):
         career_trajectory = st.select_slider(
@@ -71,53 +72,53 @@ with st.sidebar:
         - Growth tapers near ${tc_soft_cap/1000:.0f}k cap
         """)
 
-    st.subheader("Starting Balances")
-    col1, col2 = st.columns(2)
-    with col1:
-        seed_taxable = st.number_input("Taxable ($)", 0, 1000000, 0, step=10000)
-        seed_401k = st.number_input("401(k) ($)", 0, 1000000, 0, step=10000)
-    with col2:
-        seed_roth = st.number_input("Roth IRA ($)", 0, 500000, 0, step=1000)
-        seed_hsa = st.number_input("HSA ($)", 0, 100000, 0, step=1000)
+    with st.expander("Starting Balances", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            seed_taxable = st.number_input("Taxable ($)", 0, 1000000, 0, step=10000)
+            seed_401k = st.number_input("401(k) ($)", 0, 1000000, 0, step=10000)
+        with col2:
+            seed_roth = st.number_input("Roth IRA ($)", 0, 500000, 0, step=1000)
+            seed_hsa = st.number_input("HSA ($)", 0, 100000, 0, step=1000)
 
-    seed_total = seed_taxable + seed_401k + seed_roth + seed_hsa
-    st.metric("Total Starting Seed", f"${seed_total:,.0f}")
+        seed_total = seed_taxable + seed_401k + seed_roth + seed_hsa
+        st.metric("Total Starting Seed", f"${seed_total:,.0f}")
 
-    st.subheader("Family")
-    marriage_age = st.slider("Marriage Age", 25, 40, 29)
+    with st.expander("Family", expanded=False):
+        marriage_age = st.slider("Marriage Age", 25, 40, 29)
 
-    num_kids = st.radio("Number of Kids", [0, 1, 2], index=2, horizontal=True)
-    kid_ages = ()
-    if num_kids >= 1:
-        kid1_age = st.slider("First Kid Born (Your Age)", 26, 45, 31)
-        kid_ages = (kid1_age,)
-        if num_kids == 2:
-            kid2_age = st.slider("Second Kid Born (Your Age)", kid1_age, 47, max(33, kid1_age + 2))
-            kid_ages = (kid1_age, kid2_age)
+        num_kids = st.radio("Number of Kids", [0, 1, 2], index=2, horizontal=True)
+        kid_ages = ()
+        if num_kids >= 1:
+            kid1_age = st.slider("First Kid Born (Your Age)", 26, 45, 31)
+            kid_ages = (kid1_age,)
+            if num_kids == 2:
+                kid2_age = st.slider("Second Kid Born (Your Age)", kid1_age, 47, max(33, kid1_age + 2))
+                kid_ages = (kid1_age, kid2_age)
 
-    st.subheader("Spouse Income")
-    spouse_works = st.toggle("Spouse Works", value=True)
+    with st.expander("Spouse Income", expanded=False):
+        spouse_works = st.toggle("Spouse Works", value=True)
 
-    if spouse_works:
-        spouse_salary = st.slider("Spouse Salary ($)", 0, 200000, 80000, step=5000, format="$%d")
-        part_time_fraction = st.slider("Part-time Fraction", 0.0, 1.0, 0.5, step=0.1,
-                                       help="After kids start school")
-    else:
-        spouse_salary = 0
-        part_time_fraction = 0.5
+        if spouse_works:
+            spouse_salary = st.slider("Spouse Salary ($)", 0, 200000, 80000, step=5000, format="$%d")
+            part_time_fraction = st.slider("Part-time Fraction", 0.0, 1.0, 0.5, step=0.1,
+                                           help="After kids start school")
+        else:
+            spouse_salary = 0
+            part_time_fraction = 0.5
 
-    st.subheader("Housing")
-    cfg = all_cities[city]
-    buy_home = st.toggle("Buy Home", value=cfg.home_price is not None,
-                         disabled=cfg.home_price is None,
-                         help="Not available in SF (no home price configured)")
+    with st.expander("Housing", expanded=False):
+        cfg = all_cities[city]
+        buy_home = st.toggle("Buy Home", value=cfg.home_price is not None,
+                             disabled=cfg.home_price is None,
+                             help="Not available in SF (no home price configured)")
 
-    st.subheader("Retirement Planning")
-    life_expectancy = st.slider(
-        "Life Expectancy",
-        min_value=75, max_value=100, value=LIFE_EXPECTANCY, step=1,
-        help="Simulation runs through this age to check if portfolio survives"
-    )
+    with st.expander("Retirement Planning", expanded=False):
+        life_expectancy = st.slider(
+            "Life Expectancy",
+            min_value=75, max_value=100, value=LIFE_EXPECTANCY, step=1,
+            help="Simulation runs through this age to check if portfolio survives"
+        )
 
 # =============================================================================
 # RUN SIMULATION
@@ -140,7 +141,7 @@ family_config = FamilyConfig(
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp,
-            career_trajectory, tc_soft_cap):
+            career_trajectory, tc_soft_cap, current_age):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -152,13 +153,14 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
     rng = np.random.default_rng(42)
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
                           family_config=family, career_config=career,
-                          return_trajectories=True, life_expectancy=life_exp)
+                          return_trajectories=True, life_expectancy=life_exp,
+                          current_age=current_age)
 
 with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap
+        career_trajectory, tc_soft_cap, start_age
     )
 
 # =============================================================================
@@ -324,7 +326,7 @@ with tab2:
 
     # Define age ranges for each life stage
     stage_ranges = {
-        "Pre-Marriage": (CURRENT_AGE, marriage_age - 1),
+        "Pre-Marriage": (start_age, marriage_age - 1),
         "Early Family": (marriage_age, marriage_age + 10),
         "Peak Earning": (marriage_age + 10, min(marriage_age + 20, FIRE_HORIZON)),
         "Pre-FIRE": (max(int(median_fire_age) - 5, marriage_age + 15) if median_fire_age else 40,
@@ -523,7 +525,7 @@ with tab3:
 
         # Define life stages
         stages = {
-            "Pre-Marriage": (CURRENT_AGE, marriage_age - 1),
+            "Pre-Marriage": (start_age, marriage_age - 1),
             "Early Family": (marriage_age, marriage_age + 10),
             "Peak Earning": (marriage_age + 10, min(marriage_age + 20, FIRE_HORIZON)),
             "Pre-FIRE": (max(int(median_fire_age) - 5, marriage_age + 15) if median_fire_age else 40,
@@ -831,7 +833,7 @@ with tab7:
             st.warning("No simulations reached FIRE")
 
     elif outcome_selector == "Years Until FIRE":
-        years_to_fire = fire_ages_valid - CURRENT_AGE
+        years_to_fire = fire_ages_valid - start_age
 
         fig = go.Figure()
         fig.add_trace(go.Histogram(
@@ -968,7 +970,7 @@ with tab5:
 with tab8:
     st.subheader("Cumulative FIRE Probability by Age")
 
-    ages_range = np.arange(CURRENT_AGE, FIRE_HORIZON + 1)
+    ages_range = np.arange(start_age, FIRE_HORIZON + 1)
     cdf = [(results.fire_ages <= age).mean() * 100 for age in ages_range]
 
     # Also run comparison with zero seed

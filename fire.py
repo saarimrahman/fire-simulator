@@ -365,7 +365,7 @@ def simulate_career_growth(
     return incomes
 
 def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, family_config=None,
-                   career_config=None, return_trajectories=False, life_expectancy=None):
+                   career_config=None, return_trajectories=False, life_expectancy=None, current_age=None):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
@@ -374,10 +374,13 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     career_config: CareerConfig dataclass for salary progression settings
     return_trajectories: if True, return SimulationResults with full trajectory data
     life_expectancy: age to simulate through (default: LIFE_EXPECTANCY constant)
+    current_age: starting age for simulation (default: CURRENT_AGE constant)
     """
     if life_expectancy is None:
         life_expectancy = LIFE_EXPECTANCY
-    n_years = life_expectancy - CURRENT_AGE + 1
+    if current_age is None:
+        current_age = CURRENT_AGE
+    n_years = life_expectancy - current_age + 1
     N = n_sims; cfg = CITIES[city_name]
     infl = (1 + INFLATION) ** np.arange(n_years)
 
@@ -444,7 +447,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config)
 
     # Add spouse income based on family config
-    for i, age in enumerate(range(CURRENT_AGE, FIRE_HORIZON + 1)):
+    for i, age in enumerate(range(current_age, FIRE_HORIZON + 1)):
         spouse_inc = calc_spouse_income(age, family_config, infl[i], noise=1.0)
         incomes[i] += spouse_inc * spouse_noise[i] * spouse_works_roll
 
@@ -469,10 +472,10 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     failed = np.zeros(N, dtype=bool)
     failure_ages = np.full(N, 99, dtype=int)
 
-    for i, age in enumerate(range(CURRENT_AGE, life_expectancy + 1)):
-        ye = age - CURRENT_AGE; inf = infl[ye]; mr = mr_arr[i]
+    for i, age in enumerate(range(current_age, life_expectancy + 1)):
+        ye = age - current_age; inf = infl[ye]; mr = mr_arr[i]
         # Income is zero after FIRE or after FIRE_HORIZON (forced retirement)
-        working_years_idx = min(i, FIRE_HORIZON - CURRENT_AGE)
+        working_years_idx = min(i, FIRE_HORIZON - current_age)
         year_inc = np.where(fired | (age > FIRE_HORIZON), 0.0, incomes[working_years_idx])
 
         if age < 28:
@@ -640,7 +643,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     if return_trajectories:
         return SimulationResults(
             fire_ages=fire_ages,
-            ages=np.arange(CURRENT_AGE, life_expectancy + 1),
+            ages=np.arange(current_age, life_expectancy + 1),
             incomes=traj_incomes,
             spending=traj_spending,
             taxable=traj_taxable,
