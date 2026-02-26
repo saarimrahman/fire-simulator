@@ -6,8 +6,7 @@
 import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
+from datetime import date
 
 from fire import (
     run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SimulationResults,
@@ -24,7 +23,13 @@ st.title("FIRE Simulation Dashboard")
 with st.sidebar:
     st.header("Simulation Settings")
 
-    start_age = st.slider("Current Age", min_value=18, max_value=40, value=25)
+
+    # Calculate age of someone born July 17, 2000
+    birth_date = date(2000, 7, 17)
+    today = date.today()
+    default_age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+
+    start_age = st.slider("Current Age", min_value=18, max_value=40, value=default_age)
 
     starting_tc = st.slider(
         "Starting Total Compensation ($)",
