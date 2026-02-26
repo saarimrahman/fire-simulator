@@ -128,17 +128,17 @@ def get_all_cities():
     """Return the current CITIES dict."""
     return CITIES
 
-def calc_taxes_vec(gross, state_rate, t401k=0, hsa_c=0):
+def calc_taxes_vec(gross, state_rate, t401k=0, hsa_c=0, inf=1.0):
     agi = gross - t401k - hsa_c
-    fica = np.minimum(gross, 168600) * 0.0765 + np.maximum(0, gross - 168600) * 0.0145
-    taxable = np.maximum(0, agi - 29200)
-    brackets = [(23200,0.10),(71000,0.12),(106750,0.22),(182750,0.24),(103550,0.32),(243750,0.35),(1e15,0.37)]
+    fica = np.minimum(gross, 168600*inf) * 0.0765 + np.maximum(0, gross - 168600*inf) * 0.0145
+    taxable = np.maximum(0, agi - 29200*inf)
+    brackets = [(23200*inf,0.10),(71000*inf,0.12),(106750*inf,0.22),(182750*inf,0.24),(103550*inf,0.32),(243750*inf,0.35),(1e15,0.37)]
     federal = np.zeros_like(gross, dtype=float)
     rem = taxable.copy()
     for w, r in brackets:
         federal += np.minimum(rem, w) * r
         rem = np.maximum(rem - w, 0)
-    state = np.maximum(0, agi - 14600) * state_rate
+    state = np.maximum(0, agi - 14600*inf) * state_rate
     return fica + federal + state
 
 @dataclass
@@ -597,7 +597,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
         t401k_c = np.where(~fired & (year_inc > 0), np.minimum(FOUR01K_LIMIT*inf, year_inc*0.5), 0)
         hsa_c = np.where(~fired & (year_inc > 0), (HSA_FAMILY_LIMIT if age >= kid1_born else 4150)*inf, 0.0)
-        taxes = np.where(~fired, calc_taxes_vec(year_inc, st, t401k_c, hsa_c), 0.0)
+        taxes = np.where(~fired, calc_taxes_vec(year_inc, st, t401k_c, hsa_c, inf), 0.0)
 
         net_inc = year_inc - taxes - total_spend
         wp = (~fired) & (net_inc > 0)
@@ -627,14 +627,14 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             d_tax = np.minimum(draw, np.maximum(taxable, 0)); rem1 = draw - d_tax
             d_roth = np.minimum(rem1, np.maximum(roth_basis, 0)); rem2 = rem1 - d_roth
             d_hsa = np.minimum(rem2*0.5, np.maximum(hsa_bal, 0)); rem3 = rem2 - d_hsa
-            pen = rem3*0.10; tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax)
+            pen = rem3*0.10; tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax, inf=inf)
             taxable -= d_tax; roth -= d_roth; roth_basis -= d_roth; hsa_bal -= d_hsa
             t401k -= np.where(active_retired, rem3+pen+tax_401, 0)
         else:
             # Post-60 withdrawal: proportional from all accounts
             active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
             sp = np.maximum(total_port, 1); tf = t401k/sp
-            rt = np.where(active_retired, calc_taxes_vec(ret_base_spend*tf, cfg.retirement_state_tax), 0)
+            rt = np.where(active_retired, calc_taxes_vec(ret_base_spend*tf, cfg.retirement_state_tax, inf=inf), 0)
             td = np.where(active_retired, ret_base_spend+rt, 0)
             taxable -= np.where(active_retired, td*taxable/sp, 0); t401k -= np.where(active_retired, td*t401k/sp, 0)
             roth -= np.where(active_retired, td*roth/sp, 0); hsa_bal -= np.where(active_retired, td*hsa_bal/sp, 0)
