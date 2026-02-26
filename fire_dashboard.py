@@ -106,10 +106,13 @@ with st.sidebar:
 
         if spouse_works:
             spouse_salary = st.slider("Spouse Salary ($)", 0, 200000, 80000, step=5000, format="$%d")
+            spouse_soft_cap = st.slider("Spouse Salary Cap ($)", 100000, 300000, 150000, step=10000,
+                                        format="$%d", help="Salary ceiling (growth tapers near this)")
             part_time_fraction = st.slider("Part-time Fraction", 0.0, 1.0, 0.5, step=0.1,
                                            help="After kids start school")
         else:
             spouse_salary = 0
+            spouse_soft_cap = 150000
             part_time_fraction = 0.5
 
     with st.expander("Housing", expanded=False):
@@ -140,17 +143,18 @@ family_config = FamilyConfig(
     kid_ages=kid_ages,
     spouse_works=spouse_works,
     spouse_salary=spouse_salary,
+    spouse_soft_cap=spouse_soft_cap,
     part_time_fraction=part_time_fraction,
 )
 
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
-            marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_exp,
+            marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
             career_trajectory, tc_soft_cap, current_age):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
-        spouse_salary=spouse_salary, part_time_fraction=part_time_fraction
+        spouse_salary=spouse_salary, spouse_soft_cap=spouse_soft_cap, part_time_fraction=part_time_fraction
     )
     career = CareerConfig(
         soft_cap=tc_soft_cap, trajectory=career_trajectory
@@ -164,7 +168,7 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
 with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
-        marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction, life_expectancy,
+        marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
         career_trajectory, tc_soft_cap, start_age
     )
 
