@@ -39,7 +39,7 @@ with st.sidebar:
 
     n_sims = st.select_slider(
         "Number of Simulations",
-        options=[1000, 2500, 5000, 10000, 20000, 50000],
+        options=[1000, 2500, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000],
         value=10000,
         help="More simulations = more accurate but slower"
     )

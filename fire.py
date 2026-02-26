@@ -652,10 +652,12 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         t401k += a401 + employer_match; roth += ar; roth_basis += ar; hsa_bal += ah
         taxable += np.where(wp, net_inc-a401-ar-ah, 0)
         taxable += np.where((~fired)&(net_inc<=0), net_inc, 0)
+        # Can't overdraft a brokerage — clamp working-year deficit draw at zero
+        taxable = np.maximum(taxable, 0)
 
         total_port = taxable + t401k + roth + hsa_bal
         ret_base_spend = np.where(fired & (ret_base_spend==0), total_spend, ret_base_spend)
-        wd_rate = np.where(fired & (total_port > 0), ret_base_spend/total_port, 0)
+        wd_rate = np.where(fired & (total_port > 0), ret_base_spend/np.maximum(total_port, 1), 0)
         # Use fire_swr (SWR at retirement) for withdrawal rate bounds instead of hardcoded values.
         # Normal case uses actual stochastic inflation for this year/sim so high-inflation years
         # correctly force higher spending growth (the core of stagflation-driven FIRE failures).
@@ -681,6 +683,13 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             td = np.where(active_retired, ret_base_spend+rt, 0)
             taxable -= np.where(active_retired, td*taxable/sp, 0); t401k -= np.where(active_retired, td*t401k/sp, 0)
             roth -= np.where(active_retired, td*roth/sp, 0); hsa_bal -= np.where(active_retired, td*hsa_bal/sp, 0)
+
+        # Clamp all liquid accounts at zero — overdrafts are not real money
+        taxable = np.maximum(taxable, 0)
+        t401k = np.maximum(t401k, 0)
+        roth = np.maximum(roth, 0)
+        roth_basis = np.minimum(roth_basis, roth)  # basis can't exceed balance
+        hsa_bal = np.maximum(hsa_bal, 0)
 
         # Apply market returns (skip failed portfolios to avoid overflow)
         hr = (1+mr)**0.5-1; wm = ~fired
@@ -746,8 +755,9 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             fired = fired | can_fire
             ret_base_spend = np.where(can_fire, rt, ret_base_spend)
 
-        # Track portfolio failures (portfolio went to $0 while retired)
-        just_failed = fired & ~failed & (total_port <= 0)
+        # Track portfolio failures — use post-withdrawal, post-market liquid total
+        # (total_port was computed before withdrawals and market returns; total_liq is current)
+        just_failed = fired & ~failed & (total_liq <= 0)
         failure_ages = np.where(just_failed, age, failure_ages)
         failed = failed | just_failed
 
