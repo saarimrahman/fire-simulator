@@ -203,6 +203,18 @@ class FamilyConfig:
 
 
 @dataclass
+class SocialSecurityConfig:
+    """Configuration for Social Security benefits in retirement."""
+    enabled: bool = True
+    # Annual benefit at Full Retirement Age (67 for those born 1960+), in today's dollars
+    annual_benefit_at_fra: float = 30000  # ~$2.5k/month for moderate earner
+    claiming_age: int = 67  # 62-70; benefits adjust for early/late claiming
+    # COLA: SS benefits grow with inflation; we use same infl as rest of sim
+    # Reduction factors: 62≈70%, 63≈75%, 64≈80%, 65≈86.7%, 66≈93.3%, 67=100%, 68≈108%, 69≈116%, 70≈124%
+    _FRA = 67
+
+
+@dataclass
 class CareerConfig:
     """Configuration for career/salary progression with stochastic promotions."""
     soft_cap: float = 600_000             # TC ceiling (growth tapers near this)
@@ -237,6 +249,24 @@ BASE_GROWTH_RATES = {
     "moderate":     0.015,  # 1.5% real + 3% inflation = 4.5% nominal
     "aggressive":   0.02,   # 2% real + 3% inflation = 5% nominal
 }
+
+# Social Security benefit multipliers by claiming age (FRA=67)
+# 62: 70%, 63: 75%, 64: 80%, 65: 86.67%, 66: 93.33%, 67: 100%, 68: 108%, 69: 116%, 70: 124%
+SS_CLAIMING_MULTIPLIERS = {
+    62: 0.70, 63: 0.75, 64: 0.80, 65: 86.67/100, 66: 93.33/100,
+    67: 1.00, 68: 1.08, 69: 1.16, 70: 1.24,
+}
+
+
+def calc_ss_benefit(age: int, cfg: SocialSecurityConfig, inflation: float) -> float:
+    """Annual Social Security benefit for given age, in nominal dollars.
+    Benefit starts at claiming_age and is COLA-adjusted via inflation.
+    """
+    if not cfg.enabled or age < cfg.claiming_age:
+        return 0.0
+    mult = SS_CLAIMING_MULTIPLIERS.get(cfg.claiming_age, 1.0)
+    return cfg.annual_benefit_at_fra * mult * inflation
+
 
 def calc_spouse_income(age: int, cfg: FamilyConfig, inflation: float, noise: float = 1.0) -> float:
     """Calculate spouse income for a given age based on family configuration.
@@ -405,7 +435,8 @@ def simulate_career_growth(
     return incomes
 
 def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, family_config=None,
-                   career_config=None, return_trajectories=False, life_expectancy=None, current_age=None):
+                   career_config=None, ss_config=None, return_trajectories=False, life_expectancy=None,
+                   current_age=None):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
@@ -464,6 +495,9 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
     if career_config is None:
         career_config = CareerConfig()
+
+    if ss_config is None:
+        ss_config = SocialSecurityConfig()
 
     # Derive kid ages from config
     kid_ages = sorted(family_config.kid_ages) if family_config.kid_ages else []
@@ -657,6 +691,16 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
         total_port = taxable + t401k + roth + hsa_bal
         ret_base_spend = np.where(fired & (ret_base_spend==0), total_spend, ret_base_spend)
+
+        # Social Security reduces portfolio draw when claimed
+        ss_mult = SS_CLAIMING_MULTIPLIERS.get(ss_config.claiming_age, 1.0)
+        ss_benefit = np.where(
+            fired & (age >= ss_config.claiming_age) & ss_config.enabled,
+            ss_config.annual_benefit_at_fra * ss_mult * inf,
+            0.0
+        )
+        portfolio_draw_needed = np.maximum(ret_base_spend - ss_benefit, 0)
+
         wd_rate = np.where(fired & (total_port > 0), ret_base_spend/np.maximum(total_port, 1), 0)
         # Use fire_swr (SWR at retirement) for withdrawal rate bounds instead of hardcoded values.
         # Normal case uses actual stochastic inflation for this year/sim so high-inflation years
@@ -667,22 +711,39 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
         if age < 60:
             # Pre-60 withdrawal: taxable first, then Roth basis, then HSA, then 401k with penalty
+            # Cap total draw at available portfolio to prevent over-withdrawal
+            # SS benefit (if claimed) reduces portfolio draw needed
             active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
-            draw = np.where(active_retired, ret_base_spend, 0)
-            d_tax = np.minimum(draw, np.maximum(taxable, 0)); rem1 = draw - d_tax
-            d_roth = np.minimum(rem1, np.maximum(roth_basis, 0)); rem2 = rem1 - d_roth
-            d_hsa = np.minimum(rem2*0.5, np.maximum(hsa_bal, 0)); rem3 = rem2 - d_hsa
-            pen = rem3*0.10; tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax, inf=inf)
-            taxable -= d_tax; roth -= d_roth; roth_basis -= d_roth; hsa_bal -= d_hsa
-            t401k -= np.where(active_retired, rem3+pen+tax_401, 0)
+            draw = np.where(active_retired, np.minimum(portfolio_draw_needed, total_port), 0)
+            d_tax = np.minimum(draw, np.maximum(taxable, 0))
+            rem1 = draw - d_tax
+            d_roth = np.minimum(rem1, np.maximum(roth_basis, 0))
+            rem2 = rem1 - d_roth
+            d_hsa = np.minimum(rem2 * 0.5, np.maximum(hsa_bal, 0))
+            rem3 = rem2 - d_hsa
+            # 401k: need rem3 net; gross = rem3 + 10% penalty + tax. Cap gross at balance.
+            pen = rem3 * 0.10
+            tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax, inf=inf)
+            gross_401k = rem3 + pen + tax_401
+            d_401k_gross = np.where(active_retired, np.minimum(gross_401k, np.maximum(t401k, 0)), 0)
+            taxable -= d_tax
+            roth -= d_roth
+            roth_basis -= d_roth
+            hsa_bal -= d_hsa
+            t401k -= d_401k_gross
         else:
             # Post-60 withdrawal: proportional from all accounts
+            # Cap withdrawal at available portfolio to prevent over-withdrawal
             active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
-            sp = np.maximum(total_port, 1); tf = t401k/sp
-            rt = np.where(active_retired, calc_taxes_vec(ret_base_spend*tf, cfg.retirement_state_tax, inf=inf), 0)
-            td = np.where(active_retired, ret_base_spend+rt, 0)
-            taxable -= np.where(active_retired, td*taxable/sp, 0); t401k -= np.where(active_retired, td*t401k/sp, 0)
-            roth -= np.where(active_retired, td*roth/sp, 0); hsa_bal -= np.where(active_retired, td*hsa_bal/sp, 0)
+            sp = np.maximum(total_port, 1)
+            tf = t401k / sp
+            rt = np.where(active_retired, calc_taxes_vec(portfolio_draw_needed * tf, cfg.retirement_state_tax, inf=inf), 0)
+            requested = portfolio_draw_needed + rt
+            td = np.where(active_retired, np.minimum(requested, total_port), 0)
+            taxable -= np.where(active_retired, td * taxable / sp, 0)
+            t401k -= np.where(active_retired, td * t401k / sp, 0)
+            roth -= np.where(active_retired, td * roth / sp, 0)
+            hsa_bal -= np.where(active_retired, td * hsa_bal / sp, 0)
 
         # Clamp all liquid accounts at zero — overdrafts are not real money
         taxable = np.maximum(taxable, 0)
@@ -692,13 +753,20 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         hsa_bal = np.maximum(hsa_bal, 0)
 
         # Apply market returns (skip failed portfolios to avoid overflow)
-        hr = (1+mr)**0.5-1; wm = ~fired
+        # DCA: (taxable-ns)*(1+mr)+ns*(1+hr) — when ns > taxable this can go negative; clamp after
+        hr = (1+mr)**0.5-1
+        wm = ~fired
         ns = np.where(wm & (net_inc > 0), net_inc, 0)
         active = ~failed
         taxable = np.where(active & wm, (taxable-ns)*(1+mr)+ns*(1+hr), np.where(active, taxable*(1+mr), taxable))
         t401k = np.where(active, t401k*(1+mr), t401k)
         roth = np.where(active, roth*(1+mr), roth)
         hsa_bal = np.where(active, hsa_bal*(1+mr*0.8), hsa_bal)
+        # Clamp after market returns — DCA formula can produce negative when ns > taxable
+        taxable = np.maximum(taxable, 0)
+        t401k = np.maximum(t401k, 0)
+        roth = np.maximum(roth, 0)
+        hsa_bal = np.maximum(hsa_bal, 0)
 
         total_liq = taxable + t401k + roth + hsa_bal + c529_1 + c529_2
         accessible = taxable + roth_basis + hsa_bal
@@ -711,8 +779,10 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             traj_t401k[i] = t401k.copy()
             traj_roth[i] = roth.copy()
             traj_hsa[i] = hsa_bal.copy()
-            traj_home_equity[i] = np.where(owns_home, home_val - mortgage, 0)
-            traj_net_worth[i] = total_liq + np.where(owns_home, home_val - mortgage, 0)
+            # Home equity cannot go negative (underwater mortgage) — floor at 0 for net worth
+            home_equity_val = np.where(owns_home, np.maximum(home_val - mortgage, 0), 0)
+            traj_home_equity[i] = home_equity_val
+            traj_net_worth[i] = total_liq + home_equity_val
             traj_fired[i] = fired.copy()
             # Spending breakdown
             traj_spending_housing[i] = housing
@@ -792,12 +862,14 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         )
     return fire_ages, failed, failure_ages
 
-def find_min_tc(city, target_age, conf_pct, seed_amounts=None, family_config=None, career_config=None, lo=100000, hi=700000, tol=5000):
+def find_min_tc(city, target_age, conf_pct, seed_amounts=None, family_config=None, career_config=None,
+                ss_config=None, lo=100000, hi=700000, tol=5000):
     while hi - lo > tol:
         mid = round((lo + hi) / 2 / 5000) * 5000
         rng = np.random.default_rng(42)
         fire_ages, _, _ = run_vectorized(mid, city, N_SIMS, rng, seed_amounts=seed_amounts,
-                                          family_config=family_config, career_config=career_config)
+                                          family_config=family_config, career_config=career_config,
+                                          ss_config=ss_config)
         pct = (fire_ages <= target_age).mean() * 100
         if pct >= conf_pct:
             hi = mid

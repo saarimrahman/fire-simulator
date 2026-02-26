@@ -9,8 +9,9 @@ import plotly.graph_objects as go
 from datetime import date
 
 from fire import (
-    run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SimulationResults,
-    CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
+    run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SocialSecurityConfig,
+    SimulationResults, CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig,
+    add_custom_cities, SS_CLAIMING_MULTIPLIERS,
 )
 
 st.set_page_config(page_title="FIRE Simulator", page_icon="🔥", layout="wide")
@@ -142,6 +143,27 @@ with st.sidebar:
             help="Simulation runs through this age to check if portfolio survives"
         )
 
+    with st.expander("Social Security", expanded=False):
+        ss_enabled = st.toggle("Include Social Security", value=True,
+                               help="Reduce portfolio withdrawals when SS benefits start")
+        if ss_enabled:
+            ss_annual_benefit = st.slider(
+                "Annual Benefit at FRA ($)",
+                min_value=0, max_value=60000, value=30000, step=1000,
+                format="$%d",
+                help="Expected annual SS benefit at Full Retirement Age (67). ~$30K for moderate earner."
+            )
+            ss_claiming_age = st.slider(
+                "Claiming Age",
+                min_value=62, max_value=70, value=67, step=1,
+                help="Age to start claiming. 62=reduced, 67=full, 70=maximum"
+            )
+            mult = SS_CLAIMING_MULTIPLIERS.get(ss_claiming_age, 1.0)
+            st.caption(f"At age {ss_claiming_age}: {mult*100:.0f}% of FRA benefit ≈ ${ss_annual_benefit*mult:,.0f}/yr")
+        else:
+            ss_annual_benefit = 0
+            ss_claiming_age = 67
+
 # =============================================================================
 # RUN SIMULATION
 # =============================================================================
@@ -164,7 +186,8 @@ family_config = FamilyConfig(
 @st.cache_data
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age):
+            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age,
+            ss_enabled, ss_annual_benefit, ss_claiming_age):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -174,9 +197,12 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
         soft_cap=tc_soft_cap, trajectory=career_trajectory,
         employer_match_pct=employer_match_pct, employer_match_limit=employer_match_limit
     )
+    ss = SocialSecurityConfig(
+        enabled=ss_enabled, annual_benefit_at_fra=ss_annual_benefit, claiming_age=ss_claiming_age
+    )
     rng = np.random.default_rng(42)
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
-                          family_config=family, career_config=career,
+                          family_config=family, career_config=career, ss_config=ss,
                           return_trajectories=True, life_expectancy=life_exp,
                           current_age=current_age)
 
@@ -184,7 +210,8 @@ with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
-        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age,
+        ss_enabled, ss_annual_benefit, ss_claiming_age
     )
 
 # =============================================================================
@@ -238,10 +265,10 @@ if pct_failed_after_fire > 0:
 # =============================================================================
 # CHARTS
 # =============================================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "Net Worth Fan", "Cash Flow Sankey", "Spending Deep Dive",
     "Account Composition", "Income vs Spending", "FIRE Histogram",
-    "Outcome Distributions", "FIRE Probability", "Sensitivity"
+    "Outcome Distributions", "FIRE Probability", "Sensitivity", "Social Security"
 ])
 
 # Chart 1: Net Worth Fan Chart
@@ -1136,6 +1163,52 @@ with tab9:
         )
         st.plotly_chart(fig, use_container_width=True)
 
+# Chart 10: Social Security
+with tab10:
+    st.subheader("Social Security Impact")
+
+    if ss_enabled:
+        mult = SS_CLAIMING_MULTIPLIERS.get(ss_claiming_age, 1.0)
+        annual_at_claim = ss_annual_benefit * mult
+        st.markdown(f"""
+        **Your configuration:**
+        - Annual benefit at FRA (67): **${ss_annual_benefit:,.0f}**
+        - Claiming at age **{ss_claiming_age}**: **${annual_at_claim:,.0f}/yr** ({mult*100:.0f}% of FRA)
+
+        Social Security reduces the portfolio withdrawal needed in retirement. When you claim at {ss_claiming_age},
+        your portfolio only needs to cover **spending minus ${annual_at_claim:,.0f}/yr** (in today's dollars, inflation-adjusted).
+        This significantly improves portfolio survival, especially for those who FIRE early and bridge to SS.
+        """)
+
+        # Show benefit timeline
+        ages = np.arange(62, 91)
+        benefits = []
+        for a in ages:
+            if a >= ss_claiming_age:
+                benefits.append(annual_at_claim)
+            else:
+                benefits.append(0)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=ages, y=benefits,
+            mode='lines', line=dict(color='#00CC96', width=2),
+            name='Annual SS Benefit',
+            fill='tozeroy'
+        ))
+        fig.add_vline(x=ss_claiming_age, line_dash="dash", line_color="green",
+                      annotation_text=f"Claim at {ss_claiming_age}")
+        fig.update_layout(
+            xaxis_title="Age",
+            yaxis_title="Annual Benefit (today's $)",
+            yaxis=dict(tickformat='$,.0f'),
+            height=350
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption("💡 Tip: Delaying from 62 to 70 increases benefits ~77%. For early FIRE, bridge with taxable/Roth until claiming.")
+    else:
+        st.info("Enable Social Security in the sidebar to see impact on your retirement plan.")
+
 # =============================================================================
 # DATA TABLE
 # =============================================================================
@@ -1152,7 +1225,8 @@ table_mode = st.radio(
 @st.cache_data
 def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
                          marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit):
+                         city_names, career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                         ss_enabled, ss_annual_benefit, ss_claiming_age):
     ages_to_check = [40, 42, 44, 46, 48, 50, 52, 55]
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
@@ -1161,12 +1235,16 @@ def compute_min_tc_table(seed_taxable, seed_401k, seed_roth, seed_hsa,
     )
     career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
                          employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
+    ss = SocialSecurityConfig(
+        enabled=ss_enabled, annual_benefit_at_fra=ss_annual_benefit, claiming_age=ss_claiming_age
+    )
 
     data = []
     for city_name in city_names:
         row = {'City': city_name}
         for ta in ages_to_check:
-            tc = find_min_tc(city_name, ta, 90, seed_amounts=seed, family_config=family, career_config=career)
+            tc = find_min_tc(city_name, ta, 90, seed_amounts=seed, family_config=family,
+                             career_config=career, ss_config=ss)
             row[f'Age {ta}'] = f"${tc/1000:.0f}K"
         data.append(row)
     return data
@@ -1185,7 +1263,8 @@ if table_mode == "Baseline (Static)":
             baseline_seed_taxable, baseline_seed_401k, baseline_seed_roth, baseline_seed_hsa,
             baseline_marriage_age, baseline_kid_ages, baseline_spouse_works,
             baseline_spouse_salary, baseline_part_time_fraction,
-            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+            tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+            ss_enabled, ss_annual_benefit, ss_claiming_age
         )
     st.caption("Baseline: $0 starting seed, married at 29, 2 kids (ages 31, 33), spouse works ($80K, 50% part-time after kids)")
 else:
@@ -1195,7 +1274,8 @@ else:
             min_tc_data = compute_min_tc_table(
                 seed_taxable, seed_401k, seed_roth, seed_hsa,
                 marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit
+                tuple(all_cities.keys()), career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+                ss_enabled, ss_annual_benefit, ss_claiming_age
             )
             st.session_state.personalized_table = min_tc_data
 
