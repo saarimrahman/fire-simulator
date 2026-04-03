@@ -847,25 +847,63 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             if age >= ss_config.spouse_claiming_age and age >= family_config.marriage_age:
                 ss_inc += ss_spouse_annual * inf
 
-        if age < 60:
-            # Pre-60 withdrawal: taxable first, then Roth basis, then HSA, then 401k with penalty
-            active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
-            draw = np.where(active_retired, np.maximum(ret_base_spend - ss_inc, 0), 0)
-            d_tax = np.minimum(draw, np.maximum(taxable, 0)); rem1 = draw - d_tax
-            d_roth = np.minimum(rem1, np.maximum(roth_basis, 0)); rem2 = rem1 - d_roth
-            d_hsa = np.minimum(rem2*0.5, np.maximum(hsa_bal, 0)); rem3 = rem2 - d_hsa
-            pen = rem3*0.10; tax_401 = calc_taxes_vec(rem3, cfg.retirement_state_tax, inf=inf)
-            taxable -= d_tax; roth -= d_roth; roth_basis -= d_roth; hsa_bal -= d_hsa
-            t401k -= np.where(active_retired, rem3+pen+tax_401, 0)
-        else:
-            # Post-60 withdrawal: proportional from all accounts, reduced by SS
-            active_retired = fired & ~failed  # Only withdraw from non-failed portfolios
-            net_draw_need = np.where(active_retired, np.maximum(ret_base_spend - ss_inc, 0), 0)
-            sp = np.maximum(total_port, 1); tf = t401k/sp
-            rt = np.where(active_retired, calc_taxes_vec(net_draw_need*tf, cfg.retirement_state_tax, inf=inf), 0)
-            td = np.where(active_retired, net_draw_need+rt, 0)
-            taxable -= np.where(active_retired, td*taxable/sp, 0); t401k -= np.where(active_retired, td*t401k/sp, 0)
-            roth -= np.where(active_retired, td*roth/sp, 0); hsa_bal -= np.where(active_retired, td*hsa_bal/sp, 0)
+        # ---- Retirement withdrawals ----
+        # Tax rules by account:
+        #   Taxable brokerage: only long-term capital gains taxed (~15%), not full amount
+        #   Roth: always tax-free (contributions + growth after 59.5)
+        #   HSA: tax-free for medical; non-medical before 65 = income tax + 20% penalty;
+        #        non-medical after 65 = income tax only (like traditional IRA)
+        #   401k: before 59.5 (age 60) = income tax + 10% penalty; after = income tax only
+        #
+        # Withdrawal priority:
+        #   1. Taxable (minimal tax drag — only gains taxed at ~15%)
+        #   2. HSA for medical (tax-free; assume ~40% of healthcare spending can come from HSA)
+        #   3. Roth (tax-free)
+        #   4. HSA remainder (taxed, possibly penalized)
+        #   5. 401k (taxed, possibly penalized)
+
+        active_retired = fired & ~failed
+        draw = np.where(active_retired, np.maximum(ret_base_spend - ss_inc, 0), 0)
+
+        # 1. Taxable brokerage — assume 50% cost basis, so only ~50% is gains taxed at 15%
+        d_taxable = np.minimum(draw, np.maximum(taxable, 0))
+        taxable_tax = d_taxable * 0.50 * 0.15
+        taxable -= d_taxable
+        rem = draw - d_taxable
+
+        # 2. HSA for medical expenses (tax-free at any age)
+        #    Approximate: retirees can cover ~40% of healthcare costs from HSA tax-free
+        hsa_medical = np.where(active_retired, hc * 0.40, 0)
+        d_hsa_medical = np.minimum(np.minimum(hsa_medical, rem), np.maximum(hsa_bal, 0))
+        hsa_bal -= d_hsa_medical
+        rem -= d_hsa_medical
+
+        # 3. Roth — always tax-free
+        d_roth = np.minimum(rem, np.maximum(roth, 0))
+        roth -= d_roth
+        roth_basis = np.minimum(roth_basis, roth)
+        rem -= d_roth
+
+        # 4. HSA non-medical remainder
+        d_hsa_nonmed = np.minimum(rem * 0.5, np.maximum(hsa_bal, 0))
+        hsa_penalty = np.where(age < 65, d_hsa_nonmed * 0.20, 0)
+        hsa_income_tax = calc_taxes_vec(d_hsa_nonmed, cfg.retirement_state_tax, inf=inf)
+        hsa_bal -= d_hsa_nonmed
+        rem -= d_hsa_nonmed
+
+        # 5. 401k — income tax always; 10% penalty before age 60 (proxy for 59.5)
+        d_401k = np.minimum(rem, np.maximum(t401k, 0))
+        pen_401k = np.where(age < 60, d_401k * 0.10, 0)
+        tax_401k = calc_taxes_vec(d_401k, cfg.retirement_state_tax, inf=inf)
+        t401k -= d_401k
+
+        # Total tax drag from withdrawals (deducted from portfolio)
+        total_wd_tax = taxable_tax + hsa_penalty + hsa_income_tax + pen_401k + tax_401k
+        # Pay taxes from taxable first, then 401k
+        tax_from_taxable = np.minimum(total_wd_tax, np.maximum(taxable, 0))
+        taxable -= tax_from_taxable
+        tax_from_401k = total_wd_tax - tax_from_taxable
+        t401k -= np.where(active_retired, tax_from_401k, 0)
 
         # Clamp all liquid accounts at zero — overdrafts are not real money
         taxable = np.maximum(taxable, 0)
@@ -918,7 +956,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             traj_spending_healthcare[i] = np.where(is_retired_ok, actual_spend * 0.30, np.where(~fired, hc, 0))
             traj_spending_one_time[i] = np.where(fired, 0, ot)
             # Cash flow breakdown
-            traj_taxes[i] = taxes
+            traj_taxes[i] = taxes + np.where(active_retired, total_wd_tax, 0)
             traj_savings_401k[i] = a401
             traj_savings_roth[i] = ar
             traj_savings_hsa[i] = ah
