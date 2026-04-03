@@ -525,7 +525,8 @@ def simulate_career_growth(
 def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, family_config=None,
                    career_config=None, ss_config=None, return_trajectories=False,
                    life_expectancy=None, current_age=None, fire_horizon=None,
-                   hsa_annual_contrib=None, rent_override=None, lifestyle_creep_pct=0.025):
+                   hsa_annual_contrib=None, hsa_employer_contrib=0, rent_override=None,
+                   lifestyle_creep_pct=0.025, use_401k=True, use_roth=True, use_hsa=True):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
@@ -536,6 +537,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     life_expectancy: age to simulate through (default: LIFE_EXPECTANCY constant)
     current_age: starting age for simulation (default: CURRENT_AGE constant)
     hsa_annual_contrib: annual HSA contribution target in today's dollars (default: IRS max)
+    hsa_employer_contrib: annual employer HSA contribution in today's dollars (free money, default: 0)
     rent_override: monthly rent in today's dollars, overrides all city rent tiers (default: use city config)
     """
     if life_expectancy is None:
@@ -788,23 +790,25 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
 
         total_spend = housing + disc + kids + c529c + ot + hc
 
-        t401k_c = np.where(~fired & (year_inc > 0), np.minimum(FOUR01K_LIMIT*inf, year_inc*0.5), 0)
+        t401k_c = np.where(~fired & (year_inc > 0) & use_401k, np.minimum(FOUR01K_LIMIT*inf, year_inc*0.5), 0)
         hsa_limit = HSA_FAMILY_LIMIT if age >= family_config.marriage_age else HSA_INDIVIDUAL_LIMIT
-        hsa_target = hsa_annual_contrib if hsa_annual_contrib is not None else hsa_limit
+        hsa_target = (hsa_annual_contrib if hsa_annual_contrib is not None else hsa_limit) if use_hsa else 0
         hsa_target = min(hsa_target, hsa_limit)
         hsa_c = np.where(~fired & (year_inc > 0), hsa_target*inf, 0.0)
         taxes = np.where(~fired, calc_taxes_vec(year_inc, st, t401k_c, hsa_c, inf, cfg.city_tax_rate), 0.0)
 
         net_inc = year_inc - taxes - total_spend
         wp = (~fired) & (net_inc > 0)
-        a401 = np.where(wp, np.minimum(t401k_c, net_inc*0.5), 0)
-        ar = np.where(wp, np.minimum(ROTH_IRA_LIMIT*inf, net_inc*0.3), 0)
-        ah = np.where(wp, np.minimum(hsa_c, net_inc*0.2), 0)
+        a401 = np.where(wp, np.minimum(t401k_c, net_inc*0.5), 0) if use_401k else np.zeros(N)
+        ar   = np.where(wp, np.minimum(ROTH_IRA_LIMIT*inf, net_inc*0.3), 0) if use_roth else np.zeros(N)
+        ah   = np.where(wp, np.minimum(hsa_c, net_inc*0.2), 0) if use_hsa else np.zeros(N)
         # Calculate employer 401k match (free money, not from net_inc)
         matchable_cap = FOUR01K_LIMIT * inf * career_config.employer_match_limit
         matchable = np.minimum(matchable_cap, a401)
-        employer_match = np.where(wp, matchable * career_config.employer_match_pct, 0)
-        t401k += a401 + employer_match; roth += ar; roth_basis += ar; hsa_bal += ah
+        employer_match = np.where(wp & use_401k, matchable * career_config.employer_match_pct, 0)
+        # Employer HSA contribution (free money, credited during working years only)
+        hsa_emp = np.where(~fired & (year_inc > 0) & use_hsa, hsa_employer_contrib * inf, 0.0)
+        t401k += a401 + employer_match; roth += ar; roth_basis += ar; hsa_bal += ah + hsa_emp
         taxable += np.where(wp, net_inc-a401-ar-ah, 0)
         taxable += np.where((~fired)&(net_inc<=0), net_inc, 0)
         # Can't overdraft a brokerage — clamp working-year deficit draw at zero
