@@ -147,9 +147,13 @@ with st.sidebar:
         st.caption("Toggle accounts on/off. Disabled contributions flow to taxable brokerage instead.")
 
         use_401k = st.toggle("401(k)",   value=bool(_qp("use_401k", 1)), help="Max employee contribution + employer match each year")
-        use_mega_backdoor = st.toggle("Mega Backdoor Roth", value=bool(_qp("mega_backdoor", 0)),
-            help="After-tax 401k contributions converted to Roth (up to $70k total 401k limit minus pre-tax and employer match). Requires employer plan support.")
-        use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 1)), help="Annual Roth IRA contributions (subject to income limits in reality)")
+        use_mega_backdoor = st.toggle(
+            "Mega Backdoor Roth",
+            value=bool(_qp("mega_backdoor", 0)) if use_401k else False,
+            disabled=not use_401k,
+            help="After-tax 401k contributions converted to Roth (up to the annual 401k total-additions limit minus pre-tax and employer match). Requires employer plan support and an enabled 401(k)."
+        )
+        use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 1)), help="Annual direct Roth IRA contributions, with MAGI phaseout now modeled.")
         use_hsa  = st.toggle("HSA",      value=bool(_qp("use_hsa", 1)),  help="Health Savings Account contributions (requires HDHP)")
 
         if use_hsa:
@@ -252,7 +256,7 @@ with st.sidebar:
             "Lifestyle Creep (% of income)",
             min_value=0.0, max_value=20.0, value=2.5, step=0.5,
             format="%.1f%%",
-            help="Extra discretionary spending as % of gross income. Tapers to zero as you approach FIRE age 60 (people tend to optimize spending near the finish line)."
+            help="Extra discretionary spending as % of gross income. Tapers down as you approach your retirement horizon."
         ) / 100.0
 
     with st.expander("Retirement Planning", expanded=False):
@@ -266,6 +270,20 @@ with st.sidebar:
             min_value=75, max_value=100, value=_qp("life_exp", LIFE_EXPECTANCY), step=1,
             help="Simulation runs through this age to check if portfolio survives"
         )
+        custom_swr_enabled = st.toggle(
+            "Override Safe Withdrawal Rate",
+            value=st.query_params.get("swr") is not None,
+            help="Use a fixed SWR everywhere instead of the simulator's age-based default."
+        )
+        if custom_swr_enabled:
+            swr_override = st.slider(
+                "Custom SWR (%)",
+                min_value=2.5, max_value=6.0, value=float(_qp("swr", 4.0, float)), step=0.1,
+                format="%.1f%%",
+                help="Applies a fixed withdrawal rate to the FIRE target instead of the age-based auto SWR."
+            ) / 100.0
+        else:
+            swr_override = None
 
 # =============================================================================
 # RUN SIMULATION
@@ -293,7 +311,8 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
             ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming,
             hsa_annual_contrib=None, hsa_employer_contrib=0, rent_override=None,
             lifestyle_creep_pct=0.025, wedding_budget=60000, fire_horizon=60,
-            use_401k=True, use_roth=True, use_hsa=True, use_mega_backdoor=False):
+            use_401k=True, use_roth=True, use_hsa=True, use_mega_backdoor=False,
+            swr_override=None):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -318,7 +337,7 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
                           hsa_employer_contrib=hsa_employer_contrib,
                           rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct,
                           use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa,
-                          use_mega_backdoor=use_mega_backdoor)
+                          use_mega_backdoor=use_mega_backdoor, swr_override=swr_override)
 
 with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
@@ -330,7 +349,7 @@ with st.spinner("Running simulation..."):
         rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct,
         wedding_budget=wedding_budget, fire_horizon=fire_horizon,
         use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa,
-        use_mega_backdoor=use_mega_backdoor
+        use_mega_backdoor=use_mega_backdoor, swr_override=swr_override
     )
 
 # Sync current settings to URL query params (shareable link)
@@ -349,14 +368,17 @@ if not use_401k: _params["use_401k"] = 0
 if use_mega_backdoor: _params["mega_backdoor"] = 1
 if not use_roth: _params["use_roth"] = 0
 if not use_hsa:  _params["use_hsa"] = 0
+if swr_override is not None: _params["swr"] = round(swr_override * 100, 1)
 st.query_params.update(_params)
+if swr_override is None and "swr" in st.query_params:
+    del st.query_params["swr"]
 
 # =============================================================================
 # KEY METRICS
 # =============================================================================
 FIRE_HORIZON_AGE = fire_horizon
 
-# Voluntary FIRE = achieved FIRE before forced retirement at 60
+# Voluntary FIRE = achieved FIRE before forced retirement at the selected horizon
 voluntary_fire = results.fire_ages[results.fire_ages < FIRE_HORIZON_AGE]
 all_retired = results.fire_ages[results.fire_ages < 99]
 fire_ages_valid = voluntary_fire  # For histograms and percentile calculations
@@ -374,10 +396,10 @@ pct_failed = results.failed.mean() * 100
 col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
     st.metric("FIRE Rate", f"{pct_fire:.1f}%",
-              help="% of simulations that achieved voluntary FIRE before age 60")
+              help=f"% of simulations that achieved voluntary FIRE before age {fire_horizon}")
 with col2:
     st.metric("Success Rate", f"{pct_success:.1f}%",
-              help=f"Portfolio survived to age {life_expectancy} (everyone retires at 60)")
+              help=f"Portfolio survived to age {life_expectancy} (everyone retires by age {fire_horizon})")
 with col3:
     st.metric("Median FIRE Age", f"{median_fire_age:.0f}" if median_fire_age else "N/A")
 with col4:

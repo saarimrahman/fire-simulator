@@ -9,7 +9,7 @@ import pytest
 
 from fire import (
     run_vectorized, simulate_career_growth, calc_taxes_vec, calc_swr,
-    calc_retirement_hc,
+    calc_retirement_hc, calc_taxable_brokerage_sale, calc_roth_ira_limit,
     SeedAmounts, FamilyConfig, CareerConfig, SocialSecurityConfig,
     CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY,
     FOUR01K_LIMIT, FOUR01K_TOTAL_LIMIT, ROTH_IRA_LIMIT,
@@ -147,6 +147,13 @@ class TestTaxes:
         tax_no_city = calc_taxes_vec(inc, 0.05, city_tax_rate=0.0)
         tax_city = calc_taxes_vec(inc, 0.05, city_tax_rate=0.035)
         assert tax_city[0] > tax_no_city[0]
+
+    def test_single_pays_more_than_married_joint_same_income(self):
+        inc = np.array([200_000.0])
+        tax_single = calc_taxes_vec(inc, 0.05, filing_status="single")
+        tax_joint = calc_taxes_vec(inc, 0.05, filing_status="married_joint")
+        assert tax_single[0] > tax_joint[0], \
+            f"Single filer should pay more at same income: single={tax_single[0]:,.0f} joint={tax_joint[0]:,.0f}"
 
 
 # =========================================================================
@@ -334,6 +341,31 @@ class TestSocialSecurity:
             # Over 13 years at ~3% inflation: expect ratio ~1.47. Bug would give ~1.94
             assert 1.2 < ratio < 1.85, f"SS growth ratio {ratio:.2f} looks wrong"
 
+    def test_large_ss_can_create_taxable_income_even_with_roth_funding(self):
+        """Federal tax code can tax part of Social Security even if spending is funded from Roth."""
+        common = dict(
+            seed=1, tc=200_000, n=1000,
+            seeds=SeedAmounts(roth=2_000_000),
+            use_401k=False, use_hsa=False,
+            fire_horizon=45,
+            family=FamilyConfig(kid_ages=()),
+            ss=SocialSecurityConfig(
+                enabled=True,
+                claiming_age=67,
+                spouse_claiming_age=67,
+                monthly_benefit_today=7_000,
+                spouse_monthly_benefit=5_000,
+            ),
+        )
+        r = _run(**common)
+        age_70_idx = 70 - r.ages[0]
+        retired = r.fired_status[age_70_idx] & ~r.failed
+        if retired.sum() < 50:
+            pytest.skip("Not enough retirees at 70")
+        taxes_70 = np.median(r.taxes[age_70_idx, retired])
+        assert taxes_70 > 1_000, \
+            f"Large SS should create some taxable income even with Roth funding: {taxes_70:,.0f}"
+
 
 # =========================================================================
 # Career growth
@@ -393,6 +425,21 @@ class TestHSAEmployer:
         nw_yes = np.median(r_yes.net_worth[-1])
         assert nw_yes > nw_no, "Employer HSA should improve ending NW"
 
+    def test_employer_hsa_counts_toward_annual_limit(self):
+        """Employer HSA money should reduce the employee contribution room."""
+        r = _run(
+            seed=1, tc=300_000, n=1000,
+            use_401k=False, use_roth=False,
+            hsa_employer_contrib=7_000,
+            family=FamilyConfig(marriage_age=35, kid_ages=(), spouse_works=False),
+        )
+        age_36_idx = 36 - r.ages[0]
+        employee_hsa = np.median(r.savings_hsa[age_36_idx])
+        # Family limit is $8,550, so with a $7,000 employer contribution the
+        # employee should only have about $1,550 of remaining room.
+        assert 1_000 < employee_hsa < 2_500, \
+            f"Employee HSA room should shrink after employer funding: {employee_hsa:,.0f}"
+
 
 # =========================================================================
 # Safe withdrawal rate
@@ -409,6 +456,18 @@ class TestSWR:
         for age in [35, 45, 55, 65]:
             swr = calc_swr(age, 90)
             assert 0.02 < swr < 0.06, f"SWR at {age} = {swr:.3f} out of range"
+
+    def test_swr_override_changes_fire_number(self):
+        r_default = _run(seed=1, n=2000, family=FamilyConfig(kid_ages=()))
+        r_low = _run(seed=1, n=2000, family=FamilyConfig(kid_ages=()), swr_override=0.03)
+        mask_default = r_default.fire_ages < 99
+        mask_low = r_low.fire_ages < 99
+        if mask_default.sum() < 50 or mask_low.sum() < 50:
+            pytest.skip("Not enough FIRE'd sims")
+        fn_default = np.median(r_default.fire_number[mask_default])
+        fn_low = np.median(r_low.fire_number[mask_low])
+        assert fn_low > fn_default * 1.15, \
+            f"Lower SWR override should require a bigger nest egg: default={fn_default:,.0f} low={fn_low:,.0f}"
 
 
 # =========================================================================
@@ -564,22 +623,27 @@ class TestContributionMechanics:
         assert abs(tax_on - tax_off) / max(tax_off, 1) < 0.02, \
             f"Mega backdoor should not change taxes: on={tax_on:,.0f} off={tax_off:,.0f}"
 
+    def test_high_income_single_cannot_make_direct_roth_contribution(self):
+        """Direct Roth IRA contributions should phase out at high MAGI."""
+        r = _run(
+            seed=1, tc=400_000, n=1000,
+            use_401k=False, use_hsa=False, use_roth=True,
+            family=FamilyConfig(marriage_age=35, kid_ages=(), spouse_works=False),
+        )
+        roth_yr0 = np.median(r.savings_roth[0])
+        assert roth_yr0 == 0, f"High-income single filer should be phased out of direct Roth: {roth_yr0:,.0f}"
+
     def test_total_savings_equals_net_income(self):
         """All net income should be allocated: 401k + Roth + HSA + brokerage."""
         r = _run(seed=1, n=500)
         for yr in [0, 5, 10]:
-            s401k = np.median(r.savings_401k[yr])
-            sroth = np.median(r.savings_roth[yr])
-            shsa = np.median(r.savings_hsa[yr])
-            stax = np.median(r.savings_taxable[yr])
-            inc = np.median(r.incomes[yr])
-            taxes = np.median(r.taxes[yr])
-            spend = np.median(r.spending[yr])
-            net = inc - taxes - spend
-            saved = s401k + sroth + shsa + stax
-            if net > 0:
-                assert abs(saved - net) / max(net, 1) < 0.15, \
-                    f"Year {yr}: net={net:,.0f} saved={saved:,.0f} gap={abs(saved-net):,.0f}"
+            saved = (r.savings_401k[yr] + r.savings_roth[yr] +
+                     r.savings_hsa[yr] + r.savings_taxable[yr])
+            net = r.incomes[yr] - r.taxes[yr] - r.spending[yr]
+            positive = net > 1
+            if positive.sum() > 0:
+                gap = np.median(np.abs(saved[positive] - net[positive]) / np.maximum(net[positive], 1))
+                assert gap < 0.02, f"Year {yr}: per-sim savings allocation gap too large: {gap:.2%}"
 
     def test_employer_match_is_free_money(self):
         """Employer match should increase 401k without reducing net income."""
@@ -685,6 +749,20 @@ class TestWithdrawalTaxCorrectness:
         # HSA medical withdrawals are tax-free, so tax burden should be similar or less
         assert tax_hsa <= tax_no * 1.1, \
             f"HSA should not increase taxes: hsa={tax_hsa:,.0f} no_hsa={tax_no:,.0f}"
+
+
+class TestTaxableBrokerageRealism:
+    def test_taxable_sale_of_pure_basis_has_no_capital_gains_tax(self):
+        tax, new_balance, new_basis, realized_gains = calc_taxable_brokerage_sale(
+            balance=np.array([500_000.0]),
+            basis=np.array([500_000.0]),
+            withdrawal=np.array([100_000.0]),
+            state_tax_rate=0.05,
+        )
+        assert tax[0] == 0, f"Pure basis withdrawal should have no capital gains tax: {tax[0]:,.0f}"
+        assert realized_gains[0] == 0
+        assert new_balance[0] == 400_000
+        assert new_basis[0] == 400_000
 
 
 # =========================================================================
@@ -1123,22 +1201,34 @@ class TestStateTaxTransition:
     At 31+, uses the city's actual rate."""
 
     def test_nyc_taxes_lower_before_31(self):
-        """NYC has 6.85% state + 3.876% city. Before 28, state is only 5.5% with no city tax."""
+        """NYC taxes should follow the simulator's single->joint and city-tax transition."""
         r = _run(seed=1, tc=200_000, n=1000, city="New York City",
-                 use_401k=False, use_roth=False, use_hsa=False)
-        # At age 26 (year 1), state rate = 5.5%, no city tax
-        # At age 32 (year 7), state rate = 6.85%, city tax = 3.876%
+                 use_401k=False, use_roth=False, use_hsa=False,
+                 family=FamilyConfig(kid_ages=(), spouse_works=False))
         age_26_idx = 26 - r.ages[0]
         age_32_idx = 32 - r.ages[0]
-        inc_26 = np.median(r.incomes[age_26_idx])
-        inc_32 = np.median(r.incomes[age_32_idx])
         tax_26 = np.median(r.taxes[age_26_idx])
         tax_32 = np.median(r.taxes[age_32_idx])
-        # Effective rate should jump when city tax kicks in
-        eff_26 = tax_26 / max(inc_26, 1)
-        eff_32 = tax_32 / max(inc_32, 1)
-        assert eff_32 > eff_26 + 0.02, \
-            f"NYC tax rate should jump at 31: age26={eff_26:.2%} age32={eff_32:.2%}"
+        exp_26 = np.median(calc_taxes_vec(
+            r.incomes[age_26_idx], state_rate=0.055, city_tax_rate=0.0, filing_status="single"
+        ))
+        assert abs(tax_26 - exp_26) / max(exp_26, 1) < 0.02
+        assert tax_32 > tax_26, \
+            f"NYC taxes should still rise after marriage/city-tax transition: age26={tax_26:,.0f} age32={tax_32:,.0f}"
+
+    def test_city_tax_is_not_applied_before_31(self):
+        """Before the family phase, NYC should use the generic 5.5% state rate only."""
+        r = _run(seed=1, tc=200_000, n=1000, city="New York City",
+                 use_401k=False, use_roth=False, use_hsa=False,
+                 family=FamilyConfig(kid_ages=(), spouse_works=False))
+        age_26_idx = 26 - r.ages[0]
+        median_income = np.median(r.incomes[age_26_idx])
+        median_tax = np.median(r.taxes[age_26_idx])
+        expected = calc_taxes_vec(
+            np.array([median_income]), state_rate=0.055, city_tax_rate=0.0, filing_status="single"
+        )[0]
+        assert abs(median_tax - expected) / max(expected, 1) < 0.02, \
+            f"Pre-31 NYC taxes should exclude city tax: sim={median_tax:,.0f} expected={expected:,.0f}"
 
 
 class TestHSALimitSwitch:
@@ -1222,6 +1312,21 @@ class TestForcedRetirementSpending:
         # Voluntary includes kids + 529; forced does not
         assert vol_spend > forced_spend, \
             f"Voluntary w/kids should spend more: vol={vol_spend:,.0f} forced={forced_spend:,.0f}"
+
+    def test_forced_retirement_with_kids_includes_child_costs(self):
+        """Forced retirement spending should still include active kid and 529 costs."""
+        common = dict(seed=1, tc=120_000, n=2000, fire_horizon=40,
+                      ss=SocialSecurityConfig(enabled=False))
+        r_kids = _run(**common, family=FamilyConfig(kid_ages=(31, 33)))
+        r_no_kids = _run(**common, family=FamilyConfig(kid_ages=()))
+        forced_kids = r_kids.fire_ages == 40
+        forced_no_kids = r_no_kids.fire_ages == 40
+        if forced_kids.sum() < 50 or forced_no_kids.sum() < 50:
+            pytest.skip("Need enough forced retirees in both scenarios")
+        spend_kids = np.median(r_kids.fire_spending[forced_kids])
+        spend_no_kids = np.median(r_no_kids.fire_spending[forced_no_kids])
+        assert spend_kids > spend_no_kids + 20_000, \
+            f"Forced retirement should retain kid costs: kids={spend_kids:,.0f} no_kids={spend_no_kids:,.0f}"
 
 
 class TestInflationAdjustedLimits:
@@ -1313,6 +1418,24 @@ class TestKidCostScaling:
             pytest.skip("Not enough working sims at 54")
         kids_cost = np.median(r.spending_kids[idx, working])
         assert kids_cost == 0, f"Kid costs should be 0 after 22: {kids_cost:,.0f}"
+
+    def test_third_kid_increases_costs_and_529_savings(self):
+        """FamilyConfig.kid_ages should support more than two children."""
+        r_two = _run(seed=1, n=1000, family=FamilyConfig(kid_ages=(31, 33)))
+        r_three = _run(seed=1, n=1000, family=FamilyConfig(kid_ages=(31, 33, 35)))
+        idx = 40 - r_two.ages[0]
+        working_two = ~r_two.fired_status[idx]
+        working_three = ~r_three.fired_status[idx]
+        if working_two.sum() < 50 or working_three.sum() < 50:
+            pytest.skip("Not enough working sims at 40")
+        kids_two = np.median(r_two.spending_kids[idx, working_two])
+        kids_three = np.median(r_three.spending_kids[idx, working_three])
+        edu_two = np.median(r_two.spending_education[idx, working_two])
+        edu_three = np.median(r_three.spending_education[idx, working_three])
+        assert kids_three > kids_two * 1.2, \
+            f"A third kid should raise kid costs: two={kids_two:,.0f} three={kids_three:,.0f}"
+        assert edu_three > edu_two * 1.2, \
+            f"A third kid should raise 529 savings: two={edu_two:,.0f} three={edu_three:,.0f}"
 
 
 class TestMegaBackdoorRoomWithMatch:
@@ -1431,6 +1554,32 @@ class TestRetirementWithdrawalTaxesInTrajectory:
         # Roth withdrawals are tax-free, so taxes should be near zero
         assert taxes_70 < 5000, \
             f"Roth retirees should have near-zero withdrawal taxes: {taxes_70:,.0f}"
+
+
+# =========================================================================
+# RMD realism
+# =========================================================================
+
+class TestRequiredMinimumDistributions:
+    def test_large_401k_rmds_raise_post_73_tax_burden(self):
+        """RMDs should create extra taxable income after age 73 for traditional balances."""
+        r = _run(
+            seed=1, tc=200_000, n=1000,
+            seeds=SeedAmounts(taxable=5_000_000, t401k=2_000_000),
+            use_roth=False, use_hsa=False,
+            fire_horizon=40,
+            family=FamilyConfig(kid_ages=()),
+            ss=SocialSecurityConfig(enabled=False),
+        )
+        age_72_idx = 72 - r.ages[0]
+        age_75_idx = 75 - r.ages[0]
+        retired = r.fired_status[age_75_idx] & ~r.failed
+        if retired.sum() < 50:
+            pytest.skip("Not enough retirees at 75")
+        taxes_72 = np.median(r.taxes[age_72_idx, retired])
+        taxes_75 = np.median(r.taxes[age_75_idx, retired])
+        assert taxes_75 > taxes_72 * 1.5, \
+            f"Post-73 taxes should jump from RMD income: 72={taxes_72:,.0f} 75={taxes_75:,.0f}"
 
 
 # =========================================================================
