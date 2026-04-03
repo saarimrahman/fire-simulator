@@ -32,6 +32,7 @@ def calc_swr(fire_age: int, life_expectancy: int) -> float:
 
 INFLATION = 0.03
 FOUR01K_LIMIT = 23000
+FOUR01K_TOTAL_LIMIT = 70000  # total 415(c) limit: employee + employer + after-tax
 ROTH_IRA_LIMIT = 7000
 HSA_INDIVIDUAL_LIMIT = 4300
 HSA_FAMILY_LIMIT = 8550
@@ -199,9 +200,12 @@ def get_all_cities():
     """Return the current CITIES dict."""
     return CITIES
 
-def calc_taxes_vec(gross, state_rate, t401k=0, hsa_c=0, inf=1.0, city_tax_rate=0.0):
+def calc_taxes_vec(gross, state_rate, t401k=0, hsa_c=0, inf=1.0, city_tax_rate=0.0, include_fica=True):
     agi = gross - t401k - hsa_c
-    fica = np.minimum(gross, 168600*inf) * 0.0765 + np.maximum(0, gross - 168600*inf) * 0.0145
+    if include_fica:
+        fica = np.minimum(gross, 168600*inf) * 0.0765 + np.maximum(0, gross - 168600*inf) * 0.0145
+    else:
+        fica = np.zeros_like(gross, dtype=float)
     taxable = np.maximum(0, agi - 29200*inf)
     brackets = [(23200*inf,0.10),(71000*inf,0.12),(106750*inf,0.22),(182750*inf,0.24),(103550*inf,0.32),(243750*inf,0.35),(1e15,0.37)]
     federal = np.zeros_like(gross, dtype=float)
@@ -251,6 +255,9 @@ class SimulationResults:
     savings_hsa: np.ndarray         # (N_YEARS, N) HSA contributions
     savings_taxable: np.ndarray     # (N_YEARS, N) taxable account contributions
     ss_income: np.ndarray           # (N_YEARS, N) Social Security income
+    # FIRE number: required nest egg in today's dollars at the moment of FIRE
+    fire_number: np.ndarray         # (N,) real-dollar FIRE target per simulation
+    fire_spending: np.ndarray       # (N,) annual retirement spending in today's dollars at FIRE
 
 @dataclass
 class FamilyConfig:
@@ -526,7 +533,8 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
                    career_config=None, ss_config=None, return_trajectories=False,
                    life_expectancy=None, current_age=None, fire_horizon=None,
                    hsa_annual_contrib=None, hsa_employer_contrib=0, rent_override=None,
-                   lifestyle_creep_pct=0.025, use_401k=True, use_roth=True, use_hsa=True):
+                   lifestyle_creep_pct=0.025, use_401k=True, use_roth=True, use_hsa=True,
+                   use_mega_backdoor=False):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
@@ -687,6 +695,10 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     failed = np.zeros(N, dtype=bool)
     failure_ages = np.full(N, 99, dtype=int)
 
+    # Track the principled FIRE number (today's dollars) and retirement spending
+    fire_number_arr = np.zeros(N)
+    fire_spending_arr = np.zeros(N)
+
     for i, age in enumerate(range(current_age, life_expectancy + 1)):
         ye = age - current_age; inf = infl[ye]; mr = mr_arr[i]
         just_bought = np.zeros(N, dtype=bool)
@@ -763,9 +775,11 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         c529c = np.zeros(N)
         college_annual = family_config.college_cost_per_kid / COLLEGE_YEARS
         if kid1_born <= age < kid1_college:
-            c = contrib_per_kid*inf; c529_1 = (c529_1+c)*(1+INVESTMENT_RETURN_529); c529c += c
+            c = np.where(~fired, contrib_per_kid*inf, 0)
+            c529_1 = (c529_1+c)*(1+INVESTMENT_RETURN_529); c529c += c
         if kid2_born <= age < kid2_college:
-            c = contrib_per_kid*inf; c529_2 = (c529_2+c)*(1+INVESTMENT_RETURN_529); c529c += c
+            c = np.where(~fired, contrib_per_kid*inf, 0)
+            c529_2 = (c529_2+c)*(1+INVESTMENT_RETURN_529); c529c += c
         for off in range(COLLEGE_YEARS):
             if age == kid1_college+off: c529_1 -= np.minimum(college_annual*inf, c529_1)
             if age == kid2_college+off: c529_2 -= np.minimum(college_annual*inf, c529_2)
@@ -808,8 +822,19 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         employer_match = np.where(wp & use_401k, matchable * career_config.employer_match_pct, 0)
         # Employer HSA contribution (free money, credited during working years only)
         hsa_emp = np.where(~fired & (year_inc > 0) & use_hsa, hsa_employer_contrib * inf, 0.0)
-        t401k += a401 + employer_match; roth += ar; roth_basis += ar; hsa_bal += ah + hsa_emp
-        taxable += np.where(wp, net_inc-a401-ar-ah, 0)
+
+        # Mega backdoor Roth: after-tax 401k contributions converted to Roth.
+        # Room = total 415(c) limit - pre-tax employee - employer match.
+        # Post-tax (no deduction), but grows and withdraws tax-free as Roth.
+        if use_mega_backdoor and use_401k:
+            mega_room = np.maximum(FOUR01K_TOTAL_LIMIT * inf - a401 - employer_match, 0)
+            mega_contrib = np.where(wp, np.minimum(mega_room, np.maximum(net_inc - a401 - ar - ah, 0) * 0.5), 0)
+        else:
+            mega_contrib = np.zeros(N)
+
+        t401k += a401 + employer_match; roth += ar + mega_contrib; roth_basis += ar + mega_contrib
+        hsa_bal += ah + hsa_emp
+        taxable += np.where(wp, net_inc-a401-ar-ah-mega_contrib, 0)
         taxable += np.where((~fired)&(net_inc<=0), net_inc, 0)
         # Can't overdraft a brokerage — clamp working-year deficit draw at zero
         taxable = np.maximum(taxable, 0)
@@ -887,18 +912,23 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         # 4. HSA non-medical remainder
         d_hsa_nonmed = np.minimum(rem * 0.5, np.maximum(hsa_bal, 0))
         hsa_penalty = np.where(age < 65, d_hsa_nonmed * 0.20, 0)
-        hsa_income_tax = calc_taxes_vec(d_hsa_nonmed, cfg.retirement_state_tax, inf=inf)
         hsa_bal -= d_hsa_nonmed
         rem -= d_hsa_nonmed
 
         # 5. 401k — income tax always; 10% penalty before age 60 (proxy for 59.5)
         d_401k = np.minimum(rem, np.maximum(t401k, 0))
         pen_401k = np.where(age < 60, d_401k * 0.10, 0)
-        tax_401k = calc_taxes_vec(d_401k, cfg.retirement_state_tax, inf=inf)
         t401k -= d_401k
 
+        # Income tax on combined HSA non-medical + 401k withdrawals:
+        # ONE standard deduction, NO FICA (not earned income)
+        wd_income_tax = calc_taxes_vec(
+            d_hsa_nonmed + d_401k, cfg.retirement_state_tax,
+            inf=inf, include_fica=False,
+        )
+
         # Total tax drag from withdrawals (deducted from portfolio)
-        total_wd_tax = taxable_tax + hsa_penalty + hsa_income_tax + pen_401k + tax_401k
+        total_wd_tax = taxable_tax + hsa_penalty + wd_income_tax + pen_401k
         # Pay taxes from taxable first, then 401k
         tax_from_taxable = np.minimum(total_wd_tax, np.maximum(taxable, 0))
         taxable -= tax_from_taxable
@@ -915,14 +945,14 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         # Apply market returns (skip failed portfolios to avoid overflow)
         hr = (1+mr)**0.5-1; wm = ~fired
         # DCA: only the portion that went into taxable gets half-year return
-        taxable_new_contrib = np.where(wp, net_inc - a401 - ar - ah, 0)
+        taxable_new_contrib = np.where(wp, net_inc - a401 - ar - ah - mega_contrib, 0)
         taxable_new_contrib = np.maximum(taxable_new_contrib, 0)
         active = ~failed
         taxable = np.where(active & wm, (taxable - taxable_new_contrib)*(1+mr) + taxable_new_contrib*(1+hr),
                            np.where(active, taxable*(1+mr), taxable))
         t401k = np.where(active, t401k*(1+mr), t401k)
         roth = np.where(active, roth*(1+mr), roth)
-        hsa_bal = np.where(active, hsa_bal*(1+mr*0.8), hsa_bal)
+        hsa_bal = np.where(active, hsa_bal*(1+mr), hsa_bal)
 
         # Post-return safety clamp
         taxable = np.maximum(taxable, 0)
@@ -947,20 +977,24 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             traj_home_equity[i] = np.where(owns_home, home_val - mortgage, 0)
             traj_net_worth[i] = total_liq + np.where(owns_home, home_val - mortgage, 0)
             traj_fired[i] = fired.copy()
-            # Spending breakdown: in retirement, approximate category split
+            # Spending breakdown: in retirement, scale formula-based categories
+            # to match the guardrail-adjusted actual_spend
             is_retired_ok = fired & ~failed
-            traj_spending_housing[i] = np.where(is_retired_ok, actual_spend * 0.35, np.where(~fired, housing, 0))
-            traj_spending_disc[i] = np.where(is_retired_ok, actual_spend * 0.35, np.where(~fired, disc, 0))
-            traj_spending_kids[i] = np.where(fired, 0, kids)
-            traj_spending_education[i] = np.where(fired, 0, c529c)
-            traj_spending_healthcare[i] = np.where(is_retired_ok, actual_spend * 0.30, np.where(~fired, hc, 0))
+            formula_ret = housing + disc + hc + kids + c529c
+            scale = np.where(is_retired_ok & (formula_ret > 0),
+                             actual_spend / formula_ret, 0)
+            traj_spending_housing[i] = np.where(is_retired_ok, housing * scale, np.where(~fired, housing, 0))
+            traj_spending_disc[i] = np.where(is_retired_ok, disc * scale, np.where(~fired, disc, 0))
+            traj_spending_kids[i] = np.where(is_retired_ok, kids * scale, np.where(~fired, kids, 0))
+            traj_spending_education[i] = np.where(is_retired_ok, c529c * scale, np.where(~fired, c529c, 0))
+            traj_spending_healthcare[i] = np.where(is_retired_ok, hc * scale, np.where(~fired, hc, 0))
             traj_spending_one_time[i] = np.where(fired, 0, ot)
             # Cash flow breakdown
             traj_taxes[i] = taxes + np.where(active_retired, total_wd_tax, 0)
             traj_savings_401k[i] = a401
-            traj_savings_roth[i] = ar
+            traj_savings_roth[i] = ar + mega_contrib
             traj_savings_hsa[i] = ah
-            traj_savings_taxable[i] = np.where(wp, net_inc - a401 - ar - ah, 0)
+            traj_savings_taxable[i] = np.where(wp, net_inc - a401 - ar - ah - mega_contrib, 0)
             traj_ss_income[i] = ss_inc
 
         # Check for FIRE eligibility only during working years (up to FIRE_HORIZON)
@@ -1005,6 +1039,8 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             can_fire = (~fired) & (total_liq >= fn) & (accessible >= bridge)
             fire_ages = np.where(can_fire, age, fire_ages)
             fire_swr = np.where(can_fire, swr, fire_swr)
+            fire_number_arr = np.where(can_fire, fn / inf, fire_number_arr)
+            fire_spending_arr = np.where(can_fire, rt / inf, fire_spending_arr)
             fired = fired | can_fire
             ret_base_spend = np.where(can_fire, rt, ret_base_spend)
 
@@ -1027,8 +1063,11 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
                 rd_forced = 45000*inf
                 rhc_forced = 24000*inf + HEALTH_SHOCK_PROB*HEALTH_SHOCK_COST*inf
                 rt_forced = rh_forced + rd_forced + rhc_forced
+                fn_forced = rt_forced / swr_forced
                 fire_ages = np.where(not_yet_fired, age, fire_ages)
                 fire_swr = np.where(not_yet_fired, swr_forced, fire_swr)
+                fire_number_arr = np.where(not_yet_fired, fn_forced / inf, fire_number_arr)
+                fire_spending_arr = np.where(not_yet_fired, rt_forced / inf, fire_spending_arr)
                 ret_base_spend = np.where(not_yet_fired, rt_forced, ret_base_spend)
                 fired = fired | not_yet_fired
 
@@ -1067,6 +1106,8 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             savings_hsa=traj_savings_hsa,
             savings_taxable=traj_savings_taxable,
             ss_income=traj_ss_income,
+            fire_number=fire_number_arr,
+            fire_spending=fire_spending_arr,
         )
     return fire_ages, failed, failure_ages
 

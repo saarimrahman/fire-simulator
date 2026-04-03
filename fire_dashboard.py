@@ -147,6 +147,8 @@ with st.sidebar:
         st.caption("Toggle accounts on/off. Disabled contributions flow to taxable brokerage instead.")
 
         use_401k = st.toggle("401(k)",   value=bool(_qp("use_401k", 1)), help="Max employee contribution + employer match each year")
+        use_mega_backdoor = st.toggle("Mega Backdoor Roth", value=bool(_qp("mega_backdoor", 0)),
+            help="After-tax 401k contributions converted to Roth (up to $70k total 401k limit minus pre-tax and employer match). Requires employer plan support.")
         use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 1)), help="Annual Roth IRA contributions (subject to income limits in reality)")
         use_hsa  = st.toggle("HSA",      value=bool(_qp("use_hsa", 1)),  help="Health Savings Account contributions (requires HDHP)")
 
@@ -291,7 +293,7 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
             ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming,
             hsa_annual_contrib=None, hsa_employer_contrib=0, rent_override=None,
             lifestyle_creep_pct=0.025, wedding_budget=60000, fire_horizon=60,
-            use_401k=True, use_roth=True, use_hsa=True):
+            use_401k=True, use_roth=True, use_hsa=True, use_mega_backdoor=False):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -315,7 +317,8 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
                           hsa_annual_contrib=hsa_annual_contrib,
                           hsa_employer_contrib=hsa_employer_contrib,
                           rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct,
-                          use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa)
+                          use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa,
+                          use_mega_backdoor=use_mega_backdoor)
 
 with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
@@ -326,7 +329,8 @@ with st.spinner("Running simulation..."):
         hsa_annual_contrib=hsa_annual_contrib, hsa_employer_contrib=hsa_employer_contrib,
         rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct,
         wedding_budget=wedding_budget, fire_horizon=fire_horizon,
-        use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa
+        use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa,
+        use_mega_backdoor=use_mega_backdoor
     )
 
 # Sync current settings to URL query params (shareable link)
@@ -342,6 +346,7 @@ if seed_401k:    _params["seed_401k"] = seed_401k
 if seed_roth:    _params["seed_roth"] = seed_roth
 if seed_hsa:     _params["seed_hsa"] = seed_hsa
 if not use_401k: _params["use_401k"] = 0
+if use_mega_backdoor: _params["mega_backdoor"] = 1
 if not use_roth: _params["use_roth"] = 0
 if not use_hsa:  _params["use_hsa"] = 0
 st.query_params.update(_params)
@@ -384,24 +389,31 @@ with col5:
 current_nw = float(np.median(results.net_worth[0]))
 if len(voluntary_fire) > 0:
     _fired_mask = results.fire_ages < FIRE_HORIZON_AGE
-    _fire_age_idx = (results.fire_ages[_fired_mask] - start_age).astype(int)
-    _sim_idx = np.where(_fired_mask)[0]
-    fire_target = float(np.median(results.net_worth[_fire_age_idx, _sim_idx]))
+    # Principled FIRE target: required nest egg in today's dollars (not observed NW at FIRE).
+    # Uses fixed retirement spending estimates / SWR, independent of income trajectory.
+    fire_target = float(np.median(results.fire_number[_fired_mask]))
+    fire_ret_spend = float(np.median(results.fire_spending[_fired_mask]))
     gap = fire_target - current_nw
 
     def _fmt(v):
         return f"${v/1e6:.2f}M" if abs(v) >= 1e6 else f"${v:,.0f}"
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("FIRE Target", _fmt(fire_target),
-                  help="Median portfolio size at the moment of FIRE across fired simulations")
+                  help="Required nest egg in today's dollars — based on estimated retirement "
+                       "spending (housing + $45k discretionary + $24k healthcare + kids) "
+                       "divided by your safe withdrawal rate. Independent of income.")
     with col2:
+        st.metric("Retirement Spending", f"{_fmt(fire_ret_spend)}/yr",
+                  help="Estimated annual retirement spending in today's dollars "
+                       "(housing, discretionary, healthcare, kids, 529)")
+    with col3:
         st.metric("Current Net Worth", _fmt(current_nw),
                   help="Starting net worth from your seed amounts")
-    with col3:
+    with col4:
         st.metric("Gap to FIRE", _fmt(gap) if gap > 0 else "Already there",
-                  help="How much more you need to accumulate")
+                  help="How much more you need in today's dollars to reach your FIRE number")
 
 if pct_failed > 0:
     with st.expander(f"⚠️ {pct_failed:.1f}% of simulations ran out of money before age {life_expectancy}"):
@@ -425,9 +437,9 @@ hits zero before age {life_expectancy}.
 # =============================================================================
 # CHARTS
 # =============================================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab6, tab7, tab8 = st.tabs([
     "Net Worth Fan", "Cash Flow",
-    "Account Composition", "Income vs Spending", "FIRE Histogram",
+    "Account Composition", "Income vs Spending",
     "Outcome Distributions", "FIRE Probability", "Sensitivity"
 ])
 
@@ -658,41 +670,6 @@ with tab2:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 # Chart 5: FIRE Age Histogram
-with tab5:
-    st.subheader("FIRE Age Distribution")
-
-    fig = go.Figure()
-
-    # Histogram of FIRE ages (excluding 99s)
-    fig.add_trace(go.Histogram(
-        x=fire_ages_valid,
-        nbinsx=30,
-        name='FIRE Age',
-        marker_color='#636EFA'
-    ))
-
-    # Mark median
-    if median_fire_age:
-        fig.add_vline(x=median_fire_age, line_dash="dash", line_color="red",
-                      annotation_text=f"Median: {median_fire_age:.0f}")
-
-    never_fire_pct = 100 - pct_fire  # % that didn't achieve voluntary FIRE before 60
-    fig.update_layout(
-        xaxis_title="FIRE Age",
-        yaxis_title="Count",
-        height=500,
-        annotations=[
-            dict(
-                x=0.95, y=0.95, xref="paper", yref="paper",
-                text=f"Never FIRE: {never_fire_pct:.1f}%",
-                showarrow=False, font=dict(size=14),
-                bgcolor="rgba(255,255,255,0.8)"
-            )
-        ]
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-# Chart 6: Outcome Distributions
 with tab6:
     st.subheader("Outcome Distributions")
 
@@ -700,7 +677,8 @@ with tab6:
     with col_sel:
         outcome_selector = st.selectbox(
             "Select Metric",
-            ["Ending Net Worth (at life expectancy)", "Net Worth at FIRE", "Spending at FIRE", "Years Until FIRE"],
+            ["Ending Net Worth (at life expectancy)", "Net Worth at FIRE", "Spending at FIRE",
+             "FIRE Age Distribution", "Years Until FIRE"],
             help="Choose which outcome to visualize"
         )
     with col_tog:
@@ -926,6 +904,46 @@ with tab6:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning("No simulations reached FIRE")
+
+    elif outcome_selector == "FIRE Age Distribution":
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(
+            x=fire_ages_valid,
+            nbinsx=30,
+            name='FIRE Age',
+            marker_color='#636EFA'
+        ))
+
+        if median_fire_age:
+            fig.add_vline(x=median_fire_age, line_dash="dash", line_color="red",
+                          annotation_text=f"Median: {median_fire_age:.0f}")
+
+        never_fire_pct = 100 - pct_fire
+        fig.update_layout(
+            xaxis_title="FIRE Age",
+            yaxis_title="Count",
+            height=500,
+            annotations=[
+                dict(
+                    x=0.95, y=0.95, xref="paper", yref="paper",
+                    text=f"Never FIRE: {never_fire_pct:.1f}%",
+                    showarrow=False, font=dict(size=14),
+                    bgcolor="rgba(255,255,255,0.8)"
+                )
+            ]
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Median", f"{median_fire_age:.0f}" if median_fire_age else "N/A")
+        with col2:
+            st.metric("P10", f"{p10_fire_age:.0f}" if p10_fire_age else "N/A")
+        with col3:
+            st.metric("P90", f"{p90_fire_age:.0f}" if p90_fire_age else "N/A")
+        with col4:
+            st.metric("FIRE Rate", f"{pct_fire:.1f}%")
+
+        st.plotly_chart(fig, use_container_width=True)
 
     elif outcome_selector == "Years Until FIRE":
         years_to_fire = fire_ages_valid - start_age

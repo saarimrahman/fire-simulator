@@ -14,12 +14,23 @@ streamlit run fire_dashboard.py
 ./venv/bin/streamlit run fire_dashboard.py
 ```
 
+## Running tests
+
+```bash
+./venv/bin/pytest test_fire.py -v
+# or with the venv activated:
+pytest test_fire.py -v
+```
+
+The test suite (`test_fire.py`) has 115+ tests covering tax calculations, account toggles, withdrawal ordering, Social Security, career growth, FIRE eligibility, spending trajectories, cross-feature interactions, and financial edge cases. Tests run in ~6 seconds using 2,000 simulations per test. Always run the full suite after changing `fire.py`.
+
 ## Architecture
 
-This is a two-file project:
+Three-file project:
 
-- **`fire.py`** — Simulation engine. Contains all financial logic, dataclasses, and the core `run_vectorized()` function.
+- **`fire.py`** — Simulation engine. All financial logic, dataclasses, and the core `run_vectorized()` function.
 - **`fire_dashboard.py`** — Streamlit UI. Imports from `fire.py`, renders sidebar controls, and builds all charts.
+- **`test_fire.py`** — pytest suite. Imports from `fire.py`, uses a `_run()` helper wrapper for consistent test setup.
 
 ### Simulation design
 
@@ -51,7 +62,7 @@ The simulation is **fully vectorized with numpy**: it runs `N_SIMS` (default 10,
 
 ### City data
 
-Built-in cities (Sacramento, Dublin, San Francisco) are defined as `CityConfig` instances in the `CITIES` dict. The dashboard allows users to add custom cities via `add_custom_cities()`, which updates the global dict.
+Built-in cities (Sacramento, Dublin, San Francisco, New York City) are defined as `CityConfig` instances in the `CITIES` dict. The dashboard allows users to add custom cities via `add_custom_cities()`, which updates the global dict.
 
 ## Dependencies
 
@@ -60,6 +71,7 @@ numpy==2.4.2
 streamlit==1.54.0
 plotly==6.5.2
 tabulate==0.9.0
+pytest (dev)
 ```
 
-Install: `pip install -r requirements.txt`
+Install: `pip install -r requirements.txt && pip install pytest`
