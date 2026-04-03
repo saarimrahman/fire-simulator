@@ -10,7 +10,14 @@ from datetime import date
 
 from fire import (
     run_vectorized, find_min_tc, SeedAmounts, FamilyConfig, CareerConfig, SocialSecurityConfig,
-    SimulationResults, CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, CityConfig, add_custom_cities
+    SimulationResults, CITIES, CURRENT_AGE, FIRE_HORIZON, LIFE_EXPECTANCY, INFLATION, CityConfig, add_custom_cities,
+    FOUR01K_LIMIT, ROTH_IRA_LIMIT, HSA_INDIVIDUAL_LIMIT, HSA_FAMILY_LIMIT,
+    HEALTH_SHOCK_PROB, HEALTH_SHOCK_COST,
+    OT_CAR_MOVE, OT_BABY_SETUP, OT_MID_UPGRADE, HOME_CLOSING_COSTS,
+    HC_YOUNG, HC_OLDER, HC_RET_BASE, HC_RET_AGE_STEP, HC_RET_REAL_GROWTH, HC_MEDICARE,
+    DISC_YOUNG, DISC_MID, DISC_FAMILY, DISC_STEP_35, DISC_STEP_40,
+    JL_ANNUAL_PROB, JL_MONTHS_MIN, JL_MONTHS_MAX, JL_REENTRY_MIN, JL_REENTRY_MAX, JL_SEARCH_COST,
+    MR_NORMAL_MEAN, MR_NORMAL_STD, MR_RECESSION_MEAN, MR_RECESSION_STD, RECESSION_PROB,
 )
 
 st.set_page_config(page_title="FIRE Simulator", page_icon="🔥", layout="wide")
@@ -54,7 +61,16 @@ with st.sidebar:
 
     all_cities = {**CITIES, **st.session_state.custom_cities}
 
-    city = st.selectbox("City", list(all_cities.keys()), index=0)
+    _city_keys = list(all_cities.keys())
+    city = st.selectbox("City", _city_keys, index=_city_keys.index("New York City") if "New York City" in _city_keys else 0)
+
+    rent_override_enabled = st.checkbox("Override city rent", value=False)
+    rent_override = None
+    if rent_override_enabled:
+        rent_override = st.number_input(
+            "Monthly Rent ($)", min_value=0, max_value=20000, value=3000, step=100,
+            help="Overrides all city rent tiers with this monthly amount"
+        )
 
     with st.expander("Career Progression", expanded=False):
         career_trajectory = st.select_slider(
@@ -79,10 +95,10 @@ with st.sidebar:
             help="Employer contributes this % of your contribution (e.g. 50% = 50¢ per $1 you contribute)"
         ) / 100.0
         employer_match_limit = st.slider(
-            "Match Limit (% of salary)",
-            min_value=0, max_value=15, value=6, step=1,
+            "Match Limit (% of IRS limit)",
+            min_value=0, max_value=100, value=43, step=1,
             format="%d%%",
-            help="Employer matches up to this % of your salary (e.g. 6% = match on first 6% you contribute)"
+            help=f"Employer matches up to this % of the IRS 401(k) limit ($23,000). 43% ≈ $10k/yr."
         ) / 100.0
 
         st.caption(f"""
@@ -103,11 +119,23 @@ with st.sidebar:
         seed_total = seed_taxable + seed_401k + seed_roth + seed_hsa
         st.metric("Total Starting Seed", f"${seed_total:,.0f}")
 
+        hsa_annual_contrib = st.slider(
+            "Annual HSA Contribution ($)",
+            min_value=0, max_value=8550, value=8550, step=50,
+            format="$%d",
+            help="2025 IRS limits: $4,300 individual / $8,550 family. Set to 0 to skip HSA contributions."
+        )
+
     with st.expander("Family", expanded=False):
         marriage_age = st.slider("Marriage Age", 25, 40, 29)
 
         num_kids = st.radio("Number of Kids", [0, 1, 2], index=2, horizontal=True)
         kid_ages = ()
+        wedding_budget = st.number_input(
+            "Wedding Budget ($)", min_value=0, max_value=500000, value=60000, step=5000,
+            help="One-time cost in the year after your marriage age"
+        )
+
         if num_kids >= 1:
             kid1_age = st.slider("First Kid Born (Your Age)", 26, 45, 31)
             kid_ages = (kid1_age,)
@@ -176,7 +204,20 @@ with st.sidebar:
             ss_spouse_monthly = 1250
             ss_spouse_claiming = 67
 
+    with st.expander("Spending & Lifestyle", expanded=False):
+        lifestyle_creep_pct = st.slider(
+            "Lifestyle Creep (% of income)",
+            min_value=0.0, max_value=20.0, value=2.5, step=0.5,
+            format="%.1f%%",
+            help="Extra discretionary spending as % of gross income. Tapers to zero as you approach FIRE age 60 (people tend to optimize spending near the finish line)."
+        ) / 100.0
+
     with st.expander("Retirement Planning", expanded=False):
+        fire_horizon = st.slider(
+            "Latest Retirement Age",
+            min_value=50, max_value=75, value=FIRE_HORIZON, step=1,
+            help="If you haven't voluntarily FIRE'd by this age, the simulation forces retirement and you start drawing down"
+        )
         life_expectancy = st.slider(
             "Life Expectancy",
             min_value=75, max_value=100, value=LIFE_EXPECTANCY, step=1,
@@ -206,11 +247,14 @@ family_config = FamilyConfig(
 def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
             marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_exp,
             career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, current_age,
-            ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming):
+            ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming,
+            hsa_annual_contrib=None, rent_override=None, lifestyle_creep_pct=0.025, wedding_budget=60000,
+            fire_horizon=60):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
-        spouse_salary=spouse_salary, spouse_soft_cap=spouse_soft_cap, part_time_fraction=part_time_fraction
+        spouse_salary=spouse_salary, spouse_soft_cap=spouse_soft_cap, part_time_fraction=part_time_fraction,
+        wedding_budget=wedding_budget,
     )
     career = CareerConfig(
         soft_cap=tc_soft_cap, trajectory=career_trajectory,
@@ -225,20 +269,25 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
     return run_vectorized(starting_tc, city, n_sims, rng, seed_amounts=seed,
                           family_config=family, career_config=career, ss_config=ss,
                           return_trajectories=True, life_expectancy=life_exp,
-                          current_age=current_age)
+                          current_age=current_age, fire_horizon=fire_horizon,
+                          hsa_annual_contrib=hsa_annual_contrib,
+                          rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct)
 
 with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
         starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
         marriage_age, kid_ages, spouse_works, spouse_salary, spouse_soft_cap, part_time_fraction, life_expectancy,
         career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit, start_age,
-        ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
+        ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming,
+        hsa_annual_contrib=hsa_annual_contrib, rent_override=rent_override,
+        lifestyle_creep_pct=lifestyle_creep_pct, wedding_budget=wedding_budget,
+        fire_horizon=fire_horizon
     )
 
 # =============================================================================
 # KEY METRICS
 # =============================================================================
-FIRE_HORIZON_AGE = 60  # Must match FIRE_HORIZON in fire.py
+FIRE_HORIZON_AGE = fire_horizon
 
 # Voluntary FIRE = achieved FIRE before forced retirement at 60
 voluntary_fire = results.fire_ages[results.fire_ages < FIRE_HORIZON_AGE]
@@ -269,31 +318,53 @@ with col4:
 with col5:
     st.metric("P90 FIRE Age", f"{p90_fire_age:.0f}" if p90_fire_age else "N/A")
 
+# FIRE number countdown row
+current_nw = float(np.median(results.net_worth[0]))
+if len(voluntary_fire) > 0:
+    _fired_mask = results.fire_ages < FIRE_HORIZON_AGE
+    _fire_age_idx = (results.fire_ages[_fired_mask] - start_age).astype(int)
+    _sim_idx = np.where(_fired_mask)[0]
+    fire_target = float(np.median(results.net_worth[_fire_age_idx, _sim_idx]))
+    gap = fire_target - current_nw
+
+    def _fmt(v):
+        return f"${v/1e6:.2f}M" if abs(v) >= 1e6 else f"${v:,.0f}"
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("FIRE Target", _fmt(fire_target),
+                  help="Median portfolio size at the moment of FIRE across fired simulations")
+    with col2:
+        st.metric("Current Net Worth", _fmt(current_nw),
+                  help="Starting net worth from your seed amounts")
+    with col3:
+        st.metric("Gap to FIRE", _fmt(gap) if gap > 0 else "Already there",
+                  help="How much more you need to accumulate")
+
 if pct_failed > 0:
-    st.warning(f"⚠️ {pct_failed:.1f}% of simulations ran out of money before age {life_expectancy}")
-    with st.expander("Why do some simulations fail?"):
+    with st.expander(f"⚠️ {pct_failed:.1f}% of simulations ran out of money before age {life_expectancy}"):
         st.markdown(f"""
-        **{pct_failed:.1f}% of simulations depleted their portfolio before age {life_expectancy}.**
+Everyone retires by age {fire_horizon} (voluntarily or forced by the simulation). A simulation "fails" when the portfolio
+hits zero before age {life_expectancy}.
 
-        All simulations retire by age 60 (voluntarily or forced). Failures can happen because:
+**Common causes:**
+- Insufficient savings accumulated by retirement
+- Bad sequence of returns early in retirement
+- Inflation spikes eroding purchasing power
+- Unexpected medical costs
 
-        1. **Insufficient Savings**: Some paths don't accumulate enough by retirement
-        2. **Sequence of Returns Risk**: Bad market years early in retirement
-        3. **Inflation Spikes**: High inflation periods erode purchasing power
-        4. **Health Shocks**: Unexpected medical costs
-
-        **To improve success rate:**
-        - Increase starting TC or savings rate
-        - Enable Social Security benefits (sidebar)
-        - Consider a less expensive city
-        - Adjust career trajectory to aggressive
+**To improve the success rate:**
+- Increase starting TC or savings rate
+- Enable Social Security benefits (sidebar)
+- Consider a less expensive city
+- Switch to an aggressive career trajectory
         """)
 
 # =============================================================================
 # CHARTS
 # =============================================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "Net Worth Fan", "Cash Flow Sankey", "Spending Deep Dive",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "Net Worth Fan", "Cash Flow",
     "Account Composition", "Income vs Spending", "FIRE Histogram",
     "Outcome Distributions", "FIRE Probability", "Sensitivity"
 ])
@@ -302,8 +373,14 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 with tab1:
     st.subheader("Net Worth Trajectory")
 
+    real_terms = st.toggle("Inflation-adjusted (today's dollars)", value=True,
+                           help="Divides by cumulative inflation to show real purchasing power")
+
     ages = results.ages
     nw = results.net_worth
+    if real_terms:
+        infl_factors = (1 + INFLATION) ** (ages - start_age)
+        nw = nw / infl_factors[:, np.newaxis]
 
     median = np.median(nw, axis=1)
     p5 = np.percentile(nw, 5, axis=1)
@@ -392,266 +469,107 @@ with tab1:
 
 # Chart 2: Cash Flow Sankey Diagram
 with tab2:
-    st.subheader("Cash Flow Sankey Diagram")
+    st.subheader("Spending by Age")
 
-    # Life stage selector
-    life_stage = st.radio(
-        "Select Life Stage",
-        ["Pre-Marriage", "Early Family", "Peak Earning", "Pre-FIRE"],
-        horizontal=True,
-        help="Shows median cash flows for the selected life stage"
+    view = st.radio("Display", ["Annual", "Monthly"], horizontal=True, key="spend_view")
+    div = 12 if view == "Monthly" else 1
+    unit = "/mo" if view == "Monthly" else "/yr"
+
+    ages = results.ages
+    housing_med = np.median(results.spending_housing,       axis=1) / div
+    disc_med    = np.median(results.spending_discretionary, axis=1) / div
+    hc_med      = np.median(results.spending_healthcare,    axis=1) / div
+    kids_med    = np.median(results.spending_kids,          axis=1) / div
+    edu_med     = np.median(results.spending_education,     axis=1) / div
+    ot_med      = np.median(results.spending_one_time,      axis=1) / div
+    total_med   = housing_med + disc_med + hc_med + kids_med + edu_med + ot_med
+
+    spend_categories = [
+        ("Housing",         housing_med, "#2196F3"),
+        ("Discretionary",   disc_med,    "#FF9800"),
+        ("Healthcare",      hc_med,      "#F44336"),
+        ("Kids",            kids_med,    "#4CAF50"),
+        ("Education (529)", edu_med,     "#00BCD4"),
+        ("One-Time",        ot_med,      "#9C27B0"),
+    ]
+
+    fig = go.Figure()
+    for name, vals, color in spend_categories:
+        fig.add_trace(go.Bar(
+            x=ages, y=vals, name=name,
+            marker_color=color,
+            hovertemplate=f'Age %{{x}}<br>{name}: $%{{y:,.0f}}{unit}<extra></extra>'
+        ))
+
+    if median_fire_age:
+        fig.add_vline(x=median_fire_age, line_dash="dash", line_color="green",
+                      annotation_text=f"Median FIRE: {median_fire_age:.0f}")
+
+    fig.update_layout(
+        barmode='stack',
+        xaxis_title="Age",
+        yaxis_title=f"Spending ({unit})",
+        yaxis=dict(tickformat='$,.0f'),
+        hovermode='x unified',
+        height=500,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Define age ranges for each life stage
-    stage_ranges = {
-        "Pre-Marriage": (start_age, marriage_age - 1),
-        "Early Family": (marriage_age, marriage_age + 10),
-        "Peak Earning": (marriage_age + 10, min(marriage_age + 20, FIRE_HORIZON)),
-        "Pre-FIRE": (max(int(median_fire_age) - 5, marriage_age + 15) if median_fire_age else 40,
-                     int(median_fire_age) if median_fire_age else 45)
-    }
+    # Data table — every 5 years
+    s401k_med  = np.median(results.savings_401k,    axis=1) / div
+    sroth_med  = np.median(results.savings_roth,    axis=1) / div
+    shsa_med   = np.median(results.savings_hsa,     axis=1) / div
+    stax_med   = np.median(results.savings_taxable, axis=1) / div
+    saved_med  = s401k_med + sroth_med + shsa_med + stax_med
 
-    stage_start, stage_end = stage_ranges[life_stage]
+    income_med_cf = np.median(results.incomes, axis=1) / div
 
-    # Get indices for the age range
-    age_mask = (results.ages >= stage_start) & (results.ages <= stage_end)
-    age_indices = np.where(age_mask)[0]
-
-    if len(age_indices) > 0:
-        # Calculate median flows across the period
-        income_flow = np.median(results.incomes[age_indices, :])
-        taxes_flow = np.median(results.taxes[age_indices, :])
-
-        # Spending categories
-        housing_flow = np.median(results.spending_housing[age_indices, :])
-        disc_flow = np.median(results.spending_discretionary[age_indices, :])
-        kids_flow = np.median(results.spending_kids[age_indices, :])
-        edu_flow = np.median(results.spending_education[age_indices, :])
-        hc_flow = np.median(results.spending_healthcare[age_indices, :])
-        ot_flow = np.median(results.spending_one_time[age_indices, :])
-
-        # Savings categories
-        savings_401k_flow = np.median(results.savings_401k[age_indices, :])
-        savings_roth_flow = np.median(results.savings_roth[age_indices, :])
-        savings_hsa_flow = np.median(results.savings_hsa[age_indices, :])
-        savings_taxable_flow = np.median(results.savings_taxable[age_indices, :])
-
-        # Build Sankey diagram
-        # Nodes: Income, Taxes, Net Income, Spending categories, Savings categories
-        nodes = [
-            "Gross Income",      # 0
-            "Taxes",             # 1
-            "Net Income",        # 2
-            "Housing",           # 3
-            "Discretionary",     # 4
-            "Healthcare",        # 5
-            "Kids",              # 6
-            "Education (529)",   # 7
-            "One-Time",          # 8
-            "401(k) Savings",    # 9
-            "Roth IRA Savings",  # 10
-            "HSA Savings",       # 11
-            "Taxable Savings"    # 12
-        ]
-
-        # Links: source, target, value, color
-        links = []
-
-        # Income -> Taxes
-        if taxes_flow > 0:
-            links.append((0, 1, taxes_flow, 'rgba(239, 85, 59, 0.4)'))
-
-        # Income -> Net Income
-        net_income = income_flow - taxes_flow
-        if net_income > 0:
-            links.append((0, 2, net_income, 'rgba(99, 110, 250, 0.4)'))
-
-        # Net Income -> Spending categories
-        if housing_flow > 0:
-            links.append((2, 3, housing_flow, 'rgba(255, 161, 90, 0.4)'))
-        if disc_flow > 0:
-            links.append((2, 4, disc_flow, 'rgba(171, 99, 250, 0.4)'))
-        if hc_flow > 0:
-            links.append((2, 5, hc_flow, 'rgba(255, 99, 132, 0.4)'))
-        if kids_flow > 0:
-            links.append((2, 6, kids_flow, 'rgba(255, 206, 86, 0.4)'))
-        if edu_flow > 0:
-            links.append((2, 7, edu_flow, 'rgba(75, 192, 192, 0.4)'))
-        if ot_flow > 0:
-            links.append((2, 8, ot_flow, 'rgba(153, 102, 255, 0.4)'))
-
-        # Net Income -> Savings categories
-        if savings_401k_flow > 0:
-            links.append((2, 9, savings_401k_flow, 'rgba(0, 204, 150, 0.5)'))
-        if savings_roth_flow > 0:
-            links.append((2, 10, savings_roth_flow, 'rgba(0, 204, 150, 0.5)'))
-        if savings_hsa_flow > 0:
-            links.append((2, 11, savings_hsa_flow, 'rgba(0, 204, 150, 0.5)'))
-        if savings_taxable_flow > 0:
-            links.append((2, 12, savings_taxable_flow, 'rgba(0, 204, 150, 0.5)'))
-
-        # Filter out zero flows and unpack
-        links = [l for l in links if l[2] > 0]
-        sources, targets, values, colors = zip(*links) if links else ([], [], [], [])
-
-        fig = go.Figure(data=[go.Sankey(
-            node=dict(
-                pad=15,
-                thickness=20,
-                line=dict(color="black", width=0.5),
-                label=nodes,
-                color=['#636EFA', '#EF553B', '#636EFA', '#FFA15A', '#AB63FA',
-                       '#FF6384', '#FFCE56', '#4BC0C0', '#9966FF', '#00CC96',
-                       '#00CC96', '#00CC96', '#00CC96']
-            ),
-            link=dict(
-                source=list(sources),
-                target=list(targets),
-                value=list(values),
-                color=list(colors)
-            )
-        )])
-
-        fig.update_layout(
-            title=f"Median Annual Cash Flow (Age {stage_start}-{stage_end})",
-            font_size=12,
-            height=600
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Summary metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Gross Income", f"${income_flow:,.0f}")
-        with col2:
-            st.metric("Total Spending", f"${housing_flow + disc_flow + kids_flow + edu_flow + hc_flow + ot_flow:,.0f}")
-        with col3:
-            total_savings = savings_401k_flow + savings_roth_flow + savings_hsa_flow + savings_taxable_flow
-            savings_rate = total_savings / net_income * 100 if net_income > 0 else 0
-            st.metric("Savings Rate", f"{savings_rate:.1f}%")
-    else:
-        st.warning("No data available for selected life stage")
-
-# Chart 3: Spending Deep Dive
-with tab3:
-    st.subheader("Spending Deep Dive")
-
-    subtab1, subtab2 = st.tabs(["Timeline", "Life Stage Comparison"])
-
-    # Subtab A: Timeline - Stacked area chart
-    with subtab1:
-        st.caption("Median spending by category over time")
-
-        ages = results.ages
-        housing_med = np.median(results.spending_housing, axis=1)
-        disc_med = np.median(results.spending_discretionary, axis=1)
-        hc_med = np.median(results.spending_healthcare, axis=1)
-        kids_med = np.median(results.spending_kids, axis=1)
-        edu_med = np.median(results.spending_education, axis=1)
-        ot_med = np.median(results.spending_one_time, axis=1)
-
-        fig = go.Figure()
-
-        fig.add_trace(go.Scatter(
-            x=ages, y=housing_med, name='Housing',
-            mode='lines', stackgroup='one', fillcolor='rgba(255, 161, 90, 0.7)',
-            hovertemplate='Age %{x}<br>Housing: $%{y:,.0f}<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=ages, y=disc_med, name='Discretionary',
-            mode='lines', stackgroup='one', fillcolor='rgba(171, 99, 250, 0.7)',
-            hovertemplate='Age %{x}<br>Discretionary: $%{y:,.0f}<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=ages, y=hc_med, name='Healthcare',
-            mode='lines', stackgroup='one', fillcolor='rgba(255, 99, 132, 0.7)',
-            hovertemplate='Age %{x}<br>Healthcare: $%{y:,.0f}<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=ages, y=kids_med, name='Kids',
-            mode='lines', stackgroup='one', fillcolor='rgba(255, 206, 86, 0.7)',
-            hovertemplate='Age %{x}<br>Kids: $%{y:,.0f}<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=ages, y=edu_med, name='Education (529)',
-            mode='lines', stackgroup='one', fillcolor='rgba(75, 192, 192, 0.7)',
-            hovertemplate='Age %{x}<br>Education: $%{y:,.0f}<extra></extra>'
-        ))
-        fig.add_trace(go.Scatter(
-            x=ages, y=ot_med, name='One-Time',
-            mode='lines', stackgroup='one', fillcolor='rgba(153, 102, 255, 0.7)',
-            hovertemplate='Age %{x}<br>One-Time: $%{y:,.0f}<extra></extra>'
-        ))
-
-        # Mark median FIRE age
-        if median_fire_age:
-            fig.add_vline(x=median_fire_age, line_dash="dash", line_color="green",
-                          annotation_text=f"Median FIRE: {median_fire_age:.0f}")
-
-        fig.update_layout(
-            xaxis_title="Age",
-            yaxis_title="Spending per Year",
-            yaxis=dict(tickformat='$,.0f'),
-            hovermode='x unified',
-            height=500
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Subtab B: Life Stage Comparison
-    with subtab2:
-        st.caption("Average spending by category across life stages")
-
-        # Define life stages
-        stages = {
-            "Pre-Marriage": (start_age, marriage_age - 1),
-            "Early Family": (marriage_age, marriage_age + 10),
-            "Peak Earning": (marriage_age + 10, min(marriage_age + 20, FIRE_HORIZON)),
-            "Pre-FIRE": (max(int(median_fire_age) - 5, marriage_age + 15) if median_fire_age else 40,
-                         int(median_fire_age) if median_fire_age else 45)
+    st.caption("Median spending and savings by age")
+    sample_idx = list(range(0, len(ages)))
+    rows = [
+        {
+            "Age":           int(ages[i]),
+            "Housing":       f"${housing_med[i]:,.0f}",
+            "Discretionary": f"${disc_med[i]:,.0f}",
+            "Healthcare":    f"${hc_med[i]:,.0f}",
+            "Kids":          f"${kids_med[i]:,.0f}",
+            "Education":     f"${edu_med[i]:,.0f}",
+            "One-Time":      f"${ot_med[i]:,.0f}",
+            "Spending":      f"${total_med[i]:,.0f}",
+            "Earned":        f"${income_med_cf[i]:,.0f}",
+            "401(k)":        f"${s401k_med[i]:,.0f}",
+            "Roth IRA":      f"${sroth_med[i]:,.0f}",
+            "HSA":           f"${shsa_med[i]:,.0f}",
+            "Brokerage":     f"${stax_med[i]:,.0f}",
+            "Total Saved":   f"${saved_med[i]:,.0f}",
         }
+        for i in sample_idx
+    ]
 
-        categories = ['Housing', 'Discretionary', 'Healthcare', 'Kids', 'Education', 'One-Time']
-        stage_data = {cat: [] for cat in categories}
-        stage_names = []
+    # Totals row
+    totals_row = {
+        "Age":           "**Total**",
+        "Housing":       f"**${housing_med.sum():,.0f}**",
+        "Discretionary": f"**${disc_med.sum():,.0f}**",
+        "Healthcare":    f"**${hc_med.sum():,.0f}**",
+        "Kids":          f"**${kids_med.sum():,.0f}**",
+        "Education":     f"**${edu_med.sum():,.0f}**",
+        "One-Time":      f"**${ot_med.sum():,.0f}**",
+        "Spending":      f"**${total_med.sum():,.0f}**",
+        "Earned":        f"**${income_med_cf.sum():,.0f}**",
+        "401(k)":        f"**${s401k_med.sum():,.0f}**",
+        "Roth IRA":      f"**${sroth_med.sum():,.0f}**",
+        "HSA":           f"**${shsa_med.sum():,.0f}**",
+        "Brokerage":     f"**${stax_med.sum():,.0f}**",
+        "Total Saved":   f"**${saved_med.sum():,.0f}**",
+    }
+    rows.append(totals_row)
 
-        for stage_name, (s_start, s_end) in stages.items():
-            age_mask = (results.ages >= s_start) & (results.ages <= s_end)
-            age_indices = np.where(age_mask)[0]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
-            if len(age_indices) > 0:
-                stage_names.append(stage_name)
-                stage_data['Housing'].append(np.median(results.spending_housing[age_indices, :]))
-                stage_data['Discretionary'].append(np.median(results.spending_discretionary[age_indices, :]))
-                stage_data['Healthcare'].append(np.median(results.spending_healthcare[age_indices, :]))
-                stage_data['Kids'].append(np.median(results.spending_kids[age_indices, :]))
-                stage_data['Education'].append(np.median(results.spending_education[age_indices, :]))
-                stage_data['One-Time'].append(np.median(results.spending_one_time[age_indices, :]))
-
-        fig = go.Figure()
-
-        colors = ['rgba(255, 161, 90, 0.8)', 'rgba(171, 99, 250, 0.8)', 'rgba(255, 99, 132, 0.8)',
-                  'rgba(255, 206, 86, 0.8)', 'rgba(75, 192, 192, 0.8)', 'rgba(153, 102, 255, 0.8)']
-
-        for i, category in enumerate(categories):
-            fig.add_trace(go.Bar(
-                name=category,
-                x=stage_names,
-                y=stage_data[category],
-                marker_color=colors[i],
-                hovertemplate='%{y:$,.0f}<extra></extra>'
-            ))
-
-        fig.update_layout(
-            barmode='group',
-            xaxis_title="Life Stage",
-            yaxis_title="Average Spending per Year",
-            yaxis=dict(tickformat='$,.0f'),
-            height=500
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# Chart 6: FIRE Age Histogram
-with tab6:
+# Chart 5: FIRE Age Histogram
+with tab5:
     st.subheader("FIRE Age Distribution")
 
     fig = go.Figure()
@@ -685,19 +603,25 @@ with tab6:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Chart 7: Outcome Distributions
-with tab7:
+# Chart 6: Outcome Distributions
+with tab6:
     st.subheader("Outcome Distributions")
 
-    outcome_selector = st.selectbox(
-        "Select Metric",
-        ["Ending Net Worth (at life expectancy)", "Net Worth at FIRE", "Spending at FIRE", "Years Until FIRE"],
-        help="Choose which outcome to visualize"
-    )
+    col_sel, col_tog = st.columns([3, 2])
+    with col_sel:
+        outcome_selector = st.selectbox(
+            "Select Metric",
+            ["Ending Net Worth (at life expectancy)", "Net Worth at FIRE", "Spending at FIRE", "Years Until FIRE"],
+            help="Choose which outcome to visualize"
+        )
+    with col_tog:
+        real_terms_t6 = st.toggle("Inflation-adjusted (today's dollars)", value=True,
+                                  help="Deflates dollar values to today's purchasing power", key="real_t6")
 
     if outcome_selector == "Ending Net Worth (at life expectancy)":
-        # Get net worth at last age
-        ending_nw = results.net_worth[-1, :]  # Keep in dollars
+        ending_nw = results.net_worth[-1, :]
+        if real_terms_t6:
+            ending_nw = ending_nw / (1 + INFLATION) ** (life_expectancy - start_age)
         valid_data = ending_nw[ending_nw > 0]  # Exclude failures
 
         # Trim extreme outliers for better visualization
@@ -739,7 +663,7 @@ with tab7:
                           annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
 
         fig.update_layout(
-            xaxis_title=f"Net Worth at Age {life_expectancy} (P1-P99 range shown)",
+            xaxis_title=f"Net Worth at Age {life_expectancy} {'(today\'s $)' if real_terms_t6 else '(nominal)'} — P1-P99 shown",
             xaxis=dict(tickformat='$,.0f'),
             yaxis_title="Count",
             height=500
@@ -766,10 +690,12 @@ with tab7:
         for sim_idx in range(results.net_worth.shape[1]):
             fire_age = results.fire_ages[sim_idx]
             if fire_age < 99:  # Only include those who FIRE'd
-                # Find the age index
                 age_idx = np.where(results.ages == fire_age)[0]
                 if len(age_idx) > 0:
-                    fire_nw.append(results.net_worth[age_idx[0], sim_idx])
+                    val = results.net_worth[age_idx[0], sim_idx]
+                    if real_terms_t6:
+                        val = val / (1 + INFLATION) ** (fire_age - start_age)
+                    fire_nw.append(val)
 
         fire_nw = np.array(fire_nw)
 
@@ -813,7 +739,7 @@ with tab7:
                               annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
 
             fig.update_layout(
-                xaxis_title="Net Worth at FIRE (P1-P99 range shown)",
+                xaxis_title=f"Net Worth at FIRE {'(today\'s $)' if real_terms_t6 else '(nominal)'} — P1-P99 shown",
                 xaxis=dict(tickformat='$,.0f'),
                 yaxis_title="Count",
                 height=500
@@ -841,10 +767,12 @@ with tab7:
         for sim_idx in range(results.spending.shape[1]):
             fire_age = results.fire_ages[sim_idx]
             if fire_age < 99:  # Only include those who FIRE'd
-                # Find the age index
                 age_idx = np.where(results.ages == fire_age)[0]
                 if len(age_idx) > 0:
-                    fire_spending.append(results.spending[age_idx[0], sim_idx])
+                    val = results.spending[age_idx[0], sim_idx]
+                    if real_terms_t6:
+                        val = val / (1 + INFLATION) ** (fire_age - start_age)
+                    fire_spending.append(val)
 
         fire_spending = np.array(fire_spending)
 
@@ -888,7 +816,7 @@ with tab7:
                               annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
 
             fig.update_layout(
-                xaxis_title="Annual Spending at FIRE (P1-P99 range shown)",
+                xaxis_title=f"Annual Spending at FIRE {'(today\'s $)' if real_terms_t6 else '(nominal)'} — P1-P99 shown",
                 xaxis=dict(tickformat='$,.0f'),
                 yaxis_title="Count",
                 height=500
@@ -953,7 +881,7 @@ with tab7:
         st.plotly_chart(fig, use_container_width=True)
 
 # Chart 4: Account Composition Stacked Area
-with tab4:
+with tab3:
     st.subheader("Account Composition Over Time (Median)")
 
     ages = results.ages
@@ -1000,15 +928,30 @@ with tab4:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Chart 5: Income vs Spending
-with tab5:
+# Chart 4: Income vs Spending
+with tab4:
     st.subheader("Income vs Spending Trajectories (Median)")
+
+    real_terms_t4 = st.toggle("Inflation-adjusted (today's dollars)", value=True,
+                              help="Deflates to today's purchasing power", key="real_t4")
 
     ages = results.ages
     income_med = np.median(results.incomes, axis=1)
     ss_income_med = np.median(results.ss_income, axis=1)
     total_income_med = income_med + ss_income_med
     spending_med = np.median(results.spending, axis=1)
+
+    if real_terms_t4:
+        infl_factors_t4 = (1 + INFLATION) ** (ages - start_age)
+        income_med = income_med / infl_factors_t4
+        ss_income_med = ss_income_med / infl_factors_t4
+        total_income_med = total_income_med / infl_factors_t4
+        spending_med = spending_med / infl_factors_t4
+
+    total_saved = results.savings_401k + results.savings_roth + results.savings_hsa + results.savings_taxable
+    total_saved_med = np.median(total_saved, axis=1)
+    savings_rate_med = np.where(np.median(results.incomes, axis=1) > 0,
+                                total_saved_med / np.median(results.incomes, axis=1) * 100, 0)
 
     fig = go.Figure()
 
@@ -1043,21 +986,32 @@ with tab5:
         name='Surplus / Deficit', showlegend=True
     ))
 
+    # Savings rate on right axis
+    fig.add_trace(go.Scatter(
+        x=ages, y=savings_rate_med,
+        mode='lines', name='Savings Rate',
+        line=dict(color='#FFA15A', width=2, dash='dash'),
+        yaxis='y2',
+        hovertemplate='Savings Rate: %{y:.1f}%<extra></extra>'
+    ))
+
     if median_fire_age:
         fig.add_vline(x=median_fire_age, line_dash="dash", line_color="green",
                       annotation_text=f"Median FIRE: {median_fire_age:.0f}")
 
     fig.update_layout(
         xaxis_title="Age",
-        yaxis_title="Amount per Year",
-        yaxis=dict(tickformat='$,.0f'),
+        yaxis=dict(title="Amount per Year", tickformat='$,.0f'),
+        yaxis2=dict(title="Savings Rate", ticksuffix='%', overlaying='y', side='right',
+                    range=[0, max(savings_rate_med.max() * 1.2, 10)], showgrid=False),
         hovermode='x unified',
-        height=500
+        height=500,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Chart 8: FIRE Probability Curve (CDF)
-with tab8:
+# Chart 7: FIRE Probability Curve (CDF)
+with tab7:
     st.subheader("Cumulative FIRE Probability by Age")
 
     ages_range = np.arange(start_age, FIRE_HORIZON_AGE + 1)
@@ -1117,8 +1071,8 @@ with tab8:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Chart 9: Sensitivity Tornado
-with tab9:
+# Chart 8: Sensitivity Tornado
+with tab8:
     st.subheader("Sensitivity Analysis: Impact on Median FIRE Age")
     st.caption("Shows how ±20% change in each parameter affects median FIRE age")
 
@@ -1391,6 +1345,59 @@ with st.expander("Add or Edit City", expanded=False):
             st.session_state.custom_cities[city_name] = new_config
             st.success(f"{'Updated' if not is_new else 'Added'} {city_name}!")
             st.rerun()
+
+# --- Assumptions Panel ---
+with st.expander("Model Assumptions (Fixed Parameters)"):
+    st.markdown("These values are baked into the simulation engine and are not exposed as sliders.")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**IRS Contribution Limits (2025)**")
+        st.markdown(f"- 401(k): **${FOUR01K_LIMIT:,}**")
+        st.markdown(f"- Roth IRA: **${ROTH_IRA_LIMIT:,}**")
+        st.markdown(f"- HSA (individual): **${HSA_INDIVIDUAL_LIMIT:,}**")
+        st.markdown(f"- HSA (family): **${HSA_FAMILY_LIMIT:,}**")
+
+        st.markdown("**One-Time Expenses**")
+        st.markdown(f"- Car + move (age 28): **${OT_CAR_MOVE:,}**")
+        st.markdown(f"- Baby setup: **${OT_BABY_SETUP:,}**")
+        st.markdown(f"- Mid-life upgrade (age 38): **${OT_MID_UPGRADE:,}**")
+        st.markdown(f"- Home closing costs: **${HOME_CLOSING_COSTS:,}**")
+        st.markdown(f"- Job search costs: **${JL_SEARCH_COST:,}**")
+
+    with col2:
+        st.markdown("**Discretionary Spending Baselines**")
+        st.markdown(f"- Young (20s): **${DISC_YOUNG:,}/yr**")
+        st.markdown(f"- Mid (30s): **${DISC_MID:,}/yr**")
+        st.markdown(f"- Family stage: **${DISC_FAMILY:,}/yr**")
+        st.markdown(f"- Step-up at 35: **+${DISC_STEP_35:,}/yr**")
+        st.markdown(f"- Step-up at 40: **+${DISC_STEP_40:,}/yr**")
+
+        st.markdown("**Healthcare (Working)**")
+        st.markdown(f"- Under 40: **${HC_YOUNG:,}/yr**")
+        st.markdown(f"- 40+: **${HC_OLDER:,}/yr**")
+
+        st.markdown("**Healthcare (Retired / ACA)**")
+        st.markdown(f"- Base cost: **${HC_RET_BASE:,}/yr**")
+        st.markdown(f"- Age step-up: **${HC_RET_AGE_STEP:,}/yr**")
+        st.markdown(f"- Real growth rate: **{HC_RET_REAL_GROWTH:.0%}/yr**")
+        st.markdown(f"- Medicare (65+): **${HC_MEDICARE:,}/yr**")
+
+    with col3:
+        st.markdown("**Job Loss Model**")
+        st.markdown(f"- Annual layoff probability: **{JL_ANNUAL_PROB:.0%}**")
+        st.markdown(f"- Unemployment duration: **{JL_MONTHS_MIN}–{JL_MONTHS_MAX} months**")
+        st.markdown(f"- Re-entry salary: **{JL_REENTRY_MIN:.0%}–{JL_REENTRY_MAX:.0%}** of prior")
+
+        st.markdown("**Market Returns**")
+        st.markdown(f"- Normal year: **{MR_NORMAL_MEAN:.0%}** avg ± **{MR_NORMAL_STD:.0%}** std")
+        st.markdown(f"- Recession year: **{MR_RECESSION_MEAN:.0%}** avg ± **{MR_RECESSION_STD:.0%}** std")
+        st.markdown(f"- Recession probability: **{RECESSION_PROB:.0%}**/yr")
+
+        st.markdown("**Health Shock**")
+        st.markdown(f"- Annual probability: **{HEALTH_SHOCK_PROB:.1%}**")
+        st.markdown(f"- Cost per event: **${HEALTH_SHOCK_COST:,}**")
 
 # Display current cities
 if st.session_state.custom_cities:
