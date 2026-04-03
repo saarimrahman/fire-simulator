@@ -22,6 +22,16 @@ from fire import (
 
 def _amt(n): return f"\\${n:,}"
 
+def _qp(key, default, type_fn=int):
+    """Read a query param, returning *default* if missing or unparseable."""
+    raw = st.query_params.get(key)
+    if raw is None:
+        return default
+    try:
+        return type_fn(raw)
+    except (ValueError, TypeError):
+        return default
+
 st.set_page_config(page_title="FIRE Simulator", page_icon="🔥", layout="wide")
 
 st.title("FIRE Simulation Dashboard")
@@ -38,18 +48,22 @@ with st.sidebar:
     today = date.today()
     default_age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
 
-    start_age = st.slider("Current Age", min_value=18, max_value=40, value=default_age)
+    start_age = st.slider("Current Age", min_value=18, max_value=40, value=_qp("age", default_age))
 
     starting_tc = st.slider(
         "Starting Total Compensation ($)",
-        min_value=100000, max_value=500000, value=200000, step=10000,
+        min_value=100000, max_value=500000, value=_qp("tc", 200000), step=10000,
         format="$%d"
     )
 
+    _sim_options = [1000, 2500, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
+    _sim_default = _qp("sims", 10000)
+    if _sim_default not in _sim_options:
+        _sim_default = 10000
     n_sims = st.select_slider(
         "Number of Simulations",
-        options=[1000, 2500, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000],
-        value=10000,
+        options=_sim_options,
+        value=_sim_default,
         help="More simulations = more accurate but slower"
     )
 
@@ -64,7 +78,11 @@ with st.sidebar:
     all_cities = {**CITIES, **st.session_state.custom_cities}
 
     _city_keys = list(all_cities.keys())
-    city = st.selectbox("City", _city_keys, index=_city_keys.index("New York City") if "New York City" in _city_keys else 0)
+    _qp_city = st.query_params.get("city")
+    _city_default = _city_keys.index(_qp_city) if _qp_city in _city_keys else (
+        _city_keys.index("New York City") if "New York City" in _city_keys else 0
+    )
+    city = st.selectbox("City", _city_keys, index=_city_default)
 
     rent_override_enabled = st.checkbox("Override city rent", value=False)
     rent_override = None
@@ -75,16 +93,20 @@ with st.sidebar:
         )
 
     with st.expander("Career Progression", expanded=False):
+        _career_options = ["conservative", "moderate", "aggressive"]
+        _qp_career = st.query_params.get("career", "moderate")
+        if _qp_career not in _career_options:
+            _qp_career = "moderate"
         career_trajectory = st.select_slider(
             "Career Trajectory",
-            options=["conservative", "moderate", "aggressive"],
-            value="moderate",
+            options=_career_options,
+            value=_qp_career,
             help="Affects promotion probability and salary growth rate"
         )
 
         tc_soft_cap = st.slider(
             "TC Soft Cap ($)",
-            min_value=400000, max_value=1200000, value=600000, step=50000,
+            min_value=400000, max_value=1200000, value=_qp("cap", 600000), step=50000,
             format="$%d",
             help="Salary growth tapers as you approach this ceiling (most ICs plateau $500-700k)"
         )
@@ -112,11 +134,11 @@ with st.sidebar:
     with st.expander("Starting Balances", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
-            seed_taxable = st.number_input("Taxable ($)", 0, 1000000, 0, step=10000)
-            seed_401k = st.number_input("401(k) ($)", 0, 1000000, 0, step=10000)
+            seed_taxable = st.number_input("Taxable ($)", 0, 1000000, _qp("seed_tax", 0), step=10000)
+            seed_401k = st.number_input("401(k) ($)", 0, 1000000, _qp("seed_401k", 0), step=10000)
         with col2:
-            seed_roth = st.number_input("Roth IRA ($)", 0, 500000, 0, step=1000)
-            seed_hsa = st.number_input("HSA ($)", 0, 100000, 0, step=1000)
+            seed_roth = st.number_input("Roth IRA ($)", 0, 500000, _qp("seed_roth", 0), step=1000)
+            seed_hsa = st.number_input("HSA ($)", 0, 100000, _qp("seed_hsa", 0), step=1000)
 
         seed_total = seed_taxable + seed_401k + seed_roth + seed_hsa
         st.metric("Total Starting Seed", f"${seed_total:,.0f}")
@@ -124,9 +146,9 @@ with st.sidebar:
     with st.expander("Account Contributions", expanded=False):
         st.caption("Toggle accounts on/off. Disabled contributions flow to taxable brokerage instead.")
 
-        use_401k = st.toggle("401(k)",   value=True, help="Max employee contribution + employer match each year")
-        use_roth = st.toggle("Roth IRA", value=True, help="Annual Roth IRA contributions (subject to income limits in reality)")
-        use_hsa  = st.toggle("HSA",      value=True, help="Health Savings Account contributions (requires HDHP)")
+        use_401k = st.toggle("401(k)",   value=bool(_qp("use_401k", 1)), help="Max employee contribution + employer match each year")
+        use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 1)), help="Annual Roth IRA contributions (subject to income limits in reality)")
+        use_hsa  = st.toggle("HSA",      value=bool(_qp("use_hsa", 1)),  help="Health Savings Account contributions (requires HDHP)")
 
         if use_hsa:
             hsa_annual_contrib = st.slider(
@@ -146,9 +168,9 @@ with st.sidebar:
             hsa_employer_contrib = 0
 
     with st.expander("Family", expanded=False):
-        marriage_age = st.slider("Marriage Age", 25, 40, 29)
+        marriage_age = st.slider("Marriage Age", 25, 40, _qp("marriage", 29))
 
-        num_kids = st.radio("Number of Kids", [0, 1, 2], index=2, horizontal=True)
+        num_kids = st.radio("Number of Kids", [0, 1, 2], index=_qp("kids", 2), horizontal=True)
         kid_ages = ()
         wedding_budget = st.number_input(
             "Wedding Budget ($)", min_value=0, max_value=500000, value=60000, step=5000,
@@ -163,10 +185,10 @@ with st.sidebar:
                 kid_ages = (kid1_age, kid2_age)
 
     with st.expander("Spouse Income", expanded=False):
-        spouse_works = st.toggle("Spouse Works", value=True)
+        spouse_works = st.toggle("Spouse Works", value=bool(_qp("spouse", 1)))
 
         if spouse_works:
-            spouse_salary = st.slider("Spouse Salary ($)", 0, 200000, 80000, step=5000, format="$%d")
+            spouse_salary = st.slider("Spouse Salary ($)", 0, 200000, _qp("spouse_sal", 80000), step=5000, format="$%d")
             spouse_soft_cap = st.slider("Spouse Salary Cap ($)", 100000, 300000, 150000, step=10000,
                                         format="$%d", help="Salary ceiling (growth tapers near this)")
             part_time_fraction = st.slider("Part-time Fraction", 0.0, 1.0, 0.5, step=0.1,
@@ -234,12 +256,12 @@ with st.sidebar:
     with st.expander("Retirement Planning", expanded=False):
         fire_horizon = st.slider(
             "Latest Retirement Age",
-            min_value=50, max_value=75, value=FIRE_HORIZON, step=1,
+            min_value=50, max_value=75, value=_qp("fire_age", FIRE_HORIZON), step=1,
             help="If you haven't voluntarily FIRE'd by this age, the simulation forces retirement and you start drawing down"
         )
         life_expectancy = st.slider(
             "Life Expectancy",
-            min_value=75, max_value=100, value=LIFE_EXPECTANCY, step=1,
+            min_value=75, max_value=100, value=_qp("life_exp", LIFE_EXPECTANCY), step=1,
             help="Simulation runs through this age to check if portfolio survives"
         )
 
@@ -306,6 +328,23 @@ with st.spinner("Running simulation..."):
         wedding_budget=wedding_budget, fire_horizon=fire_horizon,
         use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa
     )
+
+# Sync current settings to URL query params (shareable link)
+_params = {
+    "tc": starting_tc, "city": city, "age": start_age, "sims": n_sims,
+    "career": career_trajectory, "cap": tc_soft_cap,
+    "fire_age": fire_horizon, "life_exp": life_expectancy,
+    "kids": num_kids, "marriage": marriage_age, "spouse": int(spouse_works),
+    "spouse_sal": spouse_salary,
+}
+if seed_taxable: _params["seed_tax"] = seed_taxable
+if seed_401k:    _params["seed_401k"] = seed_401k
+if seed_roth:    _params["seed_roth"] = seed_roth
+if seed_hsa:     _params["seed_hsa"] = seed_hsa
+if not use_401k: _params["use_401k"] = 0
+if not use_roth: _params["use_roth"] = 0
+if not use_hsa:  _params["use_hsa"] = 0
+st.query_params.update(_params)
 
 # =============================================================================
 # KEY METRICS
