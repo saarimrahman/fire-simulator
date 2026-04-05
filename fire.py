@@ -805,8 +805,9 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
     # Observed inflation = persistent trend + transient stagflation overlay
     inf_rates = _inf_core + recession * _stagflation
     inf_rates = np.clip(inf_rates, -0.005, 0.15)   # allow mild deflation, cap at 15%
-    # Cumulative multipliers shape (n_years, N): infl[t, sim] = product of (1+inf_rate) up to year t
-    infl = np.cumprod(1 + inf_rates, axis=0)
+    # Cumulative multipliers shape (n_years, N): infl[t, sim] = cumulative inflation factor entering year t.
+    # Year 0 (current age) = 1.0 (today's prices). Year 1 = 1+r[0], year 2 = (1+r[0])*(1+r[1]), etc.
+    infl = np.vstack([np.ones((1, N)), np.cumprod(1 + inf_rates[:-1], axis=0)])
 
     # Generate stochastic income trajectories using new career model
     incomes = simulate_career_growth(starting_tc, N, n_years, rng, career_config, current_age=current_age, fire_horizon=fire_horizon)

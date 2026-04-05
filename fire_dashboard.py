@@ -111,20 +111,6 @@ with st.sidebar:
             help="Salary growth tapers as you approach this ceiling (most ICs plateau $500-700k)"
         )
 
-        st.subheader("401(k) Employer Match")
-        employer_match_pct = st.slider(
-            "Match Rate (%)",
-            min_value=0, max_value=100, value=50, step=5,
-            format="%d%%",
-            help="Employer contributes this % of your contribution (e.g. 50% = 50¢ per $1 you contribute)"
-        ) / 100.0
-        employer_match_limit = st.slider(
-            "Match Limit (% of IRS limit)",
-            min_value=0, max_value=100, value=43, step=1,
-            format="%d%%",
-            help=f"Employer matches up to this % of the IRS 401(k) limit ($23,000). 43% ≈ $10k/yr."
-        ) / 100.0
-
         st.caption(f"""
         **{career_trajectory.title()} trajectory:**
         - {'High' if career_trajectory == 'aggressive' else 'Moderate' if career_trajectory == 'moderate' else 'Lower'} promotion probability
@@ -147,13 +133,29 @@ with st.sidebar:
         st.caption("Toggle accounts on/off. Disabled contributions flow to taxable brokerage instead.")
 
         use_401k = st.toggle("401(k)",   value=bool(_qp("use_401k", 1)), help="Max employee contribution + employer match each year")
+        if use_401k:
+            employer_match_pct = st.slider(
+                "Employer Match Rate (%)",
+                min_value=0, max_value=100, value=50, step=5,
+                format="%d%%",
+                help="Employer contributes this % of your contribution (e.g. 50% = 50¢ per $1 you contribute)"
+            ) / 100.0
+            employer_match_limit = st.slider(
+                "Employer Match Limit (% of IRS limit)",
+                min_value=0, max_value=100, value=50, step=1,
+                format="%d%%",
+                help="Employer matches contributions up to this % of the IRS 401(k) employee limit. 50% ≈ $11,500/yr."
+            ) / 100.0
+        else:
+            employer_match_pct = 0.0
+            employer_match_limit = 0.0
         use_mega_backdoor = st.toggle(
             "Mega Backdoor Roth",
             value=bool(_qp("mega_backdoor", 0)) if use_401k else False,
             disabled=not use_401k,
             help="After-tax 401k contributions converted to Roth (up to the annual 401k total-additions limit minus pre-tax and employer match). Requires employer plan support and an enabled 401(k)."
         )
-        use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 1)), help="Annual direct Roth IRA contributions, with MAGI phaseout now modeled.")
+        use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 0)), help="Annual direct Roth IRA contributions, with MAGI phaseout now modeled.")
         use_hsa  = st.toggle("HSA",      value=bool(_qp("use_hsa", 1)),  help="Health Savings Account contributions (requires HDHP)")
 
         if use_hsa:
@@ -408,7 +410,7 @@ with col5:
     st.metric("P90 FIRE Age", f"{p90_fire_age:.0f}" if p90_fire_age else "N/A")
 
 # FIRE number countdown row
-current_nw = float(np.median(results.net_worth[0]))
+current_nw = float(seed_taxable + seed_401k + seed_roth + seed_hsa)
 if len(voluntary_fire) > 0:
     _fired_mask = results.fire_ages < FIRE_HORIZON_AGE
     # Principled FIRE target: required nest egg in today's dollars (not observed NW at FIRE).
@@ -567,18 +569,29 @@ with tab1:
 with tab2:
     st.subheader("Spending by Age")
 
-    view = st.radio("Display", ["Annual", "Monthly"], horizontal=True, key="spend_view")
+    cf_col1, cf_col2 = st.columns([2, 3])
+    with cf_col1:
+        view = st.radio("Display", ["Annual", "Monthly"], horizontal=True, key="spend_view")
+    with cf_col2:
+        real_terms_cf = st.toggle("Inflation-adjusted (today's dollars)", value=True,
+                                  help="Divides by cumulative inflation to show real purchasing power", key="real_cf")
     div = 12 if view == "Monthly" else 1
     unit = "/mo" if view == "Monthly" else "/yr"
 
     ages = results.ages
-    housing_med = np.median(results.spending_housing,       axis=1) / div
-    disc_med    = np.median(results.spending_discretionary, axis=1) / div
-    hc_med      = np.median(results.spending_healthcare,    axis=1) / div
-    kids_med    = np.median(results.spending_kids,          axis=1) / div
-    edu_med     = np.median(results.spending_education,     axis=1) / div
-    ot_med      = np.median(results.spending_one_time,      axis=1) / div
-    tax_med     = np.median(results.taxes,                  axis=1) / div
+    infl_deflator = (1 + INFLATION) ** (ages - start_age)  # shape (n_years,)
+
+    def _deflate(arr):
+        """Divide by inflation factor per age if real_terms_cf is on."""
+        return arr / infl_deflator if real_terms_cf else arr
+
+    housing_med = _deflate(np.median(results.spending_housing,       axis=1)) / div
+    disc_med    = _deflate(np.median(results.spending_discretionary, axis=1)) / div
+    hc_med      = _deflate(np.median(results.spending_healthcare,    axis=1)) / div
+    kids_med    = _deflate(np.median(results.spending_kids,          axis=1)) / div
+    edu_med     = _deflate(np.median(results.spending_education,     axis=1)) / div
+    ot_med      = _deflate(np.median(results.spending_one_time,      axis=1)) / div
+    tax_med     = _deflate(np.median(results.taxes,                  axis=1)) / div
     total_med   = housing_med + disc_med + hc_med + kids_med + edu_med + ot_med + tax_med
 
     spend_categories = [
@@ -606,7 +619,7 @@ with tab2:
     fig.update_layout(
         barmode='stack',
         xaxis_title="Age",
-        yaxis_title=f"Spending ({unit})",
+        yaxis_title=f"Spending ({unit}{', today\'s $' if real_terms_cf else ', nominal $'})",
         yaxis=dict(tickformat='$,.0f'),
         hovermode='x unified',
         height=500,
@@ -614,43 +627,62 @@ with tab2:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Data table — every 5 years
-    s401k_med  = np.median(results.savings_401k,    axis=1) / div
-    sroth_med  = np.median(results.savings_roth,    axis=1) / div
-    shsa_med   = np.median(results.savings_hsa,     axis=1) / div
-    stax_med   = np.median(results.savings_taxable, axis=1) / div
+    # Data table
+    s401k_med  = _deflate(np.median(results.savings_401k,    axis=1)) / div
+    sroth_med  = _deflate(np.median(results.savings_roth,    axis=1)) / div
+    shsa_med   = _deflate(np.median(results.savings_hsa,     axis=1)) / div
+    stax_med   = _deflate(np.median(results.savings_taxable, axis=1)) / div
     saved_med  = s401k_med + sroth_med + shsa_med + stax_med
 
-    income_med_cf = np.median(results.incomes, axis=1) / div
+    income_med_cf = _deflate(np.median(results.incomes, axis=1)) / div
 
     _dash = "—"
-    st.caption("Median spending and savings by age")
-    sample_idx = list(range(0, len(ages)))
-    rows = [
-        {
-            "Age":           int(ages[i]),
+    _cf_dollar_note = "today's dollars" if real_terms_cf else "nominal dollars"
+    st.caption(f"Median spending and savings by age ({_cf_dollar_note}). Free Cash Flow = Earned − Total Spend (working years only). Small differences from Total Saved are due to median aggregation across simulations.")
+
+    sample_idx = list(range(len(ages)))
+
+    _fire_age = int(median_fire_age) if median_fire_age else None
+
+    def _row_label(age):
+        if _fire_age and age == _fire_age:
+            return f"{age} ★ FIRE"
+        if _fire_age and age > _fire_age:
+            return f"{age} (retired)"
+        return str(age)
+
+    rows = []
+    for i in sample_idx:
+        age = int(ages[i])
+        free_cf = income_med_cf[i] - total_med[i]
+        is_retired = income_med_cf[i] == 0
+        rows.append({
+            "Age":           _row_label(age),
             "Housing":       f"${housing_med[i]:,.0f}",
             "Discretionary": f"${disc_med[i]:,.0f}",
             "Healthcare":    f"${hc_med[i]:,.0f}",
-            "Kids":          f"${kids_med[i]:,.0f}",
-            "Education":     f"${edu_med[i]:,.0f}",
-            "One-Time":      f"${ot_med[i]:,.0f}",
-            "Taxes":         f"${tax_med[i]:,.0f}",
-            "401(k)":        f"${s401k_med[i]:,.0f}",
-            "Roth IRA":      f"${sroth_med[i]:,.0f}",
-            "HSA":           f"${shsa_med[i]:,.0f}",
-            "Brokerage":     f"${stax_med[i]:,.0f}",
-            "Spending":      f"${total_med[i]:,.0f}",
+            "Kids":          f"${kids_med[i]:,.0f}" if kids_med[i] > 0 else _dash,
+            "Education":     f"${edu_med[i]:,.0f}" if edu_med[i] > 0 else _dash,
+            "One-Time":      f"${ot_med[i]:,.0f}" if ot_med[i] > 0 else _dash,
             "Earned":        f"${income_med_cf[i]:,.0f}",
+            "Taxes":         f"${tax_med[i]:,.0f}",
+            "Total Spend":   f"${total_med[i]:,.0f}",
+            "401(k)":        f"${s401k_med[i]:,.0f}" if s401k_med[i] > 0 else _dash,
+            "Roth IRA":      f"${sroth_med[i]:,.0f}" if sroth_med[i] > 0 else _dash,
+            "HSA":           f"${shsa_med[i]:,.0f}" if shsa_med[i] > 0 else _dash,
+            "Brokerage":     f"${stax_med[i]:,.0f}" if stax_med[i] > 0 else _dash,
             "Total Saved":   f"${saved_med[i]:,.0f}",
+            "Free Cash Flow": _dash if is_retired else (f"${free_cf:,.0f}" if free_cf >= 0 else f"-${abs(free_cf):,.0f}"),
             "Savings %":     f"{saved_med[i] / income_med_cf[i] * 100:.0f}%" if income_med_cf[i] > 0 else _dash,
-        }
-        for i in sample_idx
-    ]
+        })
 
-    # Aggregate summary rows at the bottom
+    # Single collapsed totals row
+    _lifetime_savings_pct = saved_med.sum() / income_med_cf.sum() * 100 if income_med_cf.sum() > 0 else 0
+    _working_mask = income_med_cf > 0
+    _total_net_cf = (income_med_cf - total_med)[_working_mask].sum()
     rows.append({
-        "Age": "Total Spending",
+        "Age":           "Total",
+        "Earned":        f"${income_med_cf.sum():,.0f}",
         "Housing":       f"${housing_med.sum():,.0f}",
         "Discretionary": f"${disc_med.sum():,.0f}",
         "Healthcare":    f"${hc_med.sum():,.0f}",
@@ -658,38 +690,32 @@ with tab2:
         "Education":     f"${edu_med.sum():,.0f}",
         "One-Time":      f"${ot_med.sum():,.0f}",
         "Taxes":         f"${tax_med.sum():,.0f}",
-        "401(k)": _dash, "Roth IRA": _dash, "HSA": _dash, "Brokerage": _dash,
-        "Spending":    f"${total_med.sum():,.0f}",
-        "Earned":      _dash,
-        "Total Saved": _dash,
-        "Savings %":   _dash,
-    })
-    rows.append({
-        "Age": "Total Earned",
-        "Housing": _dash, "Discretionary": _dash, "Healthcare": _dash,
-        "Kids": _dash, "Education": _dash, "One-Time": _dash, "Taxes": _dash,
-        "401(k)": _dash, "Roth IRA": _dash, "HSA": _dash, "Brokerage": _dash,
-        "Spending":    _dash,
-        "Earned":      f"${income_med_cf.sum():,.0f}",
-        "Total Saved": _dash,
-        "Savings %":   _dash,
-    })
-    _lifetime_savings_pct = saved_med.sum() / income_med_cf.sum() * 100 if income_med_cf.sum() > 0 else 0
-    rows.append({
-        "Age": "Total Saved",
-        "Housing": _dash, "Discretionary": _dash, "Healthcare": _dash,
-        "Kids": _dash, "Education": _dash, "One-Time": _dash, "Taxes": _dash,
-        "401(k)":  f"${s401k_med.sum():,.0f}",
-        "Roth IRA": f"${sroth_med.sum():,.0f}",
-        "HSA":      f"${shsa_med.sum():,.0f}",
-        "Brokerage": f"${stax_med.sum():,.0f}",
-        "Spending":    _dash,
-        "Earned":      _dash,
-        "Total Saved": f"${saved_med.sum():,.0f}",
-        "Savings %":   f"{_lifetime_savings_pct:.0f}%",
+        "Total Spend":   f"${total_med.sum():,.0f}",
+        "401(k)":        f"${s401k_med.sum():,.0f}",
+        "Roth IRA":      f"${sroth_med.sum():,.0f}",
+        "HSA":           f"${shsa_med.sum():,.0f}",
+        "Brokerage":     f"${stax_med.sum():,.0f}",
+        "Total Saved":   f"${saved_med.sum():,.0f}",
+        "Free Cash Flow": f"${_total_net_cf:,.0f}" if _total_net_cf >= 0 else f"-${abs(_total_net_cf):,.0f}",
+        "Savings %":     f"{_lifetime_savings_pct:.0f}%",
     })
 
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    import pandas as pd
+    df_cf = pd.DataFrame(rows)
+
+    # Style: highlight FIRE row in green, retired rows in light blue, totals row in gray
+    def _style_cf_row(row):
+        label = str(row["Age"])
+        if "★ FIRE" in label:
+            return ["background-color: #1e2e1e"] * len(row)
+        if "(retired)" in label:
+            return ["background-color: #1a2030"] * len(row)
+        if label == "Total":
+            return ["background-color: #252525; font-weight: bold"] * len(row)
+        return [""] * len(row)
+
+    styled_df = df_cf.style.apply(_style_cf_row, axis=1)
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
 # Chart 5: FIRE Age Histogram
 with tab6:
