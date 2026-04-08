@@ -155,6 +155,16 @@ with st.sidebar:
             disabled=not use_401k,
             help="After-tax 401k contributions converted to Roth (up to the annual 401k total-additions limit minus pre-tax and employer match). Requires employer plan support and an enabled 401(k)."
         )
+        mega_backdoor_cap = None
+        if use_mega_backdoor:
+            _mbc_default = int(_qp("mbc", 0))
+            _mbc_val = st.number_input(
+                "Mega Backdoor cap ($/yr, 0 = max room)",
+                min_value=0, max_value=46000, value=_mbc_default, step=1000,
+                format="%d",
+                help="Cap your annual after-tax 401k contribution. 0 means use all available room (~$34–46k depending on match). Set lower if cash flow is tight."
+            )
+            mega_backdoor_cap = int(_mbc_val) if _mbc_val > 0 else None
         use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 0)), help="Annual direct Roth IRA contributions, with MAGI phaseout now modeled.")
         use_hsa  = st.toggle("HSA",      value=bool(_qp("use_hsa", 1)),  help="Health Savings Account contributions (requires HDHP)")
 
@@ -287,6 +297,29 @@ with st.sidebar:
         else:
             swr_override = None
 
+    with st.expander("Tax Settings", expanded=False):
+        tax_adjust = st.toggle(
+            "Show after-tax portfolio values",
+            value=True,
+            help="Discounts 401k by an estimated effective income-tax rate and taxable gains by LTCG rate. Roth and HSA are already tax-free."
+        )
+        if tax_adjust:
+            eff_ret_tax_rate = st.slider(
+                "Effective 401k withdrawal tax rate (%)",
+                min_value=5, max_value=40, value=20, step=1,
+                format="%d%%",
+                help="Estimated blended federal + state income-tax rate on 401k withdrawals in retirement. 20% is a reasonable middle estimate for a large 401k."
+            ) / 100.0
+            ltcg_rate = st.slider(
+                "LTCG rate on taxable gains (%)",
+                min_value=0, max_value=25, value=15, step=1,
+                format="%d%%",
+                help="Federal long-term capital gains rate (15% for most; 20% if income is high in retirement)."
+            ) / 100.0
+        else:
+            eff_ret_tax_rate = 0.20
+            ltcg_rate = 0.15
+
 # =============================================================================
 # RUN SIMULATION
 # =============================================================================
@@ -314,7 +347,7 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
             hsa_annual_contrib=None, hsa_employer_contrib=0, rent_override=None,
             lifestyle_creep_pct=0.025, wedding_budget=60000, fire_horizon=60,
             use_401k=True, use_roth=True, use_hsa=True, use_mega_backdoor=False,
-            swr_override=None):
+            mega_backdoor_cap=None, swr_override=None):
     seed = SeedAmounts(taxable=seed_taxable, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
     family = FamilyConfig(
         marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
@@ -339,7 +372,8 @@ def run_sim(starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_
                           hsa_employer_contrib=hsa_employer_contrib,
                           rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct,
                           use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa,
-                          use_mega_backdoor=use_mega_backdoor, swr_override=swr_override)
+                          use_mega_backdoor=use_mega_backdoor, mega_backdoor_cap=mega_backdoor_cap,
+                          swr_override=swr_override)
 
 with st.spinner("Running simulation..."):
     results: SimulationResults = run_sim(
@@ -351,7 +385,8 @@ with st.spinner("Running simulation..."):
         rent_override=rent_override, lifestyle_creep_pct=lifestyle_creep_pct,
         wedding_budget=wedding_budget, fire_horizon=fire_horizon,
         use_401k=use_401k, use_roth=use_roth, use_hsa=use_hsa,
-        use_mega_backdoor=use_mega_backdoor, swr_override=swr_override
+        use_mega_backdoor=use_mega_backdoor, mega_backdoor_cap=mega_backdoor_cap,
+        swr_override=swr_override
     )
 
 # Sync current settings to URL query params (shareable link)
@@ -368,6 +403,7 @@ if seed_roth:    _params["seed_roth"] = seed_roth
 if seed_hsa:     _params["seed_hsa"] = seed_hsa
 if not use_401k: _params["use_401k"] = 0
 if use_mega_backdoor: _params["mega_backdoor"] = 1
+if mega_backdoor_cap is not None: _params["mbc"] = mega_backdoor_cap
 if not use_roth: _params["use_roth"] = 0
 if not use_hsa:  _params["use_hsa"] = 0
 if swr_override is not None: _params["swr"] = round(swr_override * 100, 1)
@@ -459,6 +495,28 @@ hits zero before age {life_expectancy}.
         """)
 
 # =============================================================================
+# HELPERS
+# =============================================================================
+
+def _after_tax_nw(taxable, taxable_basis, t401k, roth, hsa, home_equity,
+                   ret_tax_rate, ltcg_rate):
+    """Convert nominal account balances to after-tax real values.
+
+    taxable:       (N_YEARS, N) or (N,) taxable brokerage balance
+    taxable_basis: matching cost-basis array
+    t401k:         401k / traditional pre-tax balance
+    roth:          Roth balance (already after-tax)
+    hsa:           HSA balance (treated as after-tax)
+    home_equity:   illiquid, not discounted
+    ret_tax_rate:  effective income-tax rate on 401k withdrawals
+    ltcg_rate:     long-term capital gains rate on taxable gains
+    """
+    gains = np.maximum(taxable - taxable_basis, 0)
+    at_taxable  = taxable  - gains * ltcg_rate
+    at_401k     = t401k    * (1 - ret_tax_rate)
+    return at_taxable + at_401k + roth + hsa + home_equity
+
+# =============================================================================
 # CHARTS
 # =============================================================================
 tab1, tab2, tab3, tab4, tab6, tab7, tab8 = st.tabs([
@@ -475,7 +533,12 @@ with tab1:
                            help="Divides by cumulative inflation to show real purchasing power")
 
     ages = results.ages
-    nw = results.net_worth
+    if tax_adjust:
+        nw = _after_tax_nw(results.taxable, results.taxable_basis, results.t401k,
+                           results.roth, results.hsa, results.home_equity,
+                           eff_ret_tax_rate, ltcg_rate)
+    else:
+        nw = results.net_worth
     if real_terms:
         infl_factors = (1 + INFLATION) ** (ages - start_age)
         nw = nw / infl_factors[:, np.newaxis]
@@ -734,7 +797,13 @@ with tab6:
                                   help="Deflates dollar values to today's purchasing power", key="real_t6")
 
     if outcome_selector == "Ending Net Worth (at life expectancy)":
-        ending_nw = results.net_worth[-1, :]
+        if tax_adjust:
+            ending_nw = _after_tax_nw(results.taxable[-1], results.taxable_basis[-1],
+                                      results.t401k[-1], results.roth[-1],
+                                      results.hsa[-1], results.home_equity[-1],
+                                      eff_ret_tax_rate, ltcg_rate)
+        else:
+            ending_nw = results.net_worth[-1, :]
         if real_terms_t6:
             ending_nw = ending_nw / (1 + INFLATION) ** (life_expectancy - start_age)
         valid_data = ending_nw[ending_nw > 0]  # Exclude failures
@@ -778,7 +847,7 @@ with tab6:
                           annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
 
         fig.update_layout(
-            xaxis_title=f"Net Worth at Age {life_expectancy} {'(today\'s $)' if real_terms_t6 else '(nominal)'} — P1-P99 shown",
+            xaxis_title=f"Net Worth at Age {life_expectancy} {'(today\'s $)' if real_terms_t6 else '(nominal)'}{'· after-tax' if tax_adjust else ''} — P1-P99 shown",
             xaxis=dict(tickformat='$,.0f'),
             yaxis_title="Count",
             height=500
@@ -807,7 +876,15 @@ with tab6:
             if fire_age < 99:  # Only include those who FIRE'd
                 age_idx = np.where(results.ages == fire_age)[0]
                 if len(age_idx) > 0:
-                    val = results.net_worth[age_idx[0], sim_idx]
+                    ai = age_idx[0]
+                    if tax_adjust:
+                        val = _after_tax_nw(
+                            results.taxable[ai, sim_idx], results.taxable_basis[ai, sim_idx],
+                            results.t401k[ai, sim_idx], results.roth[ai, sim_idx],
+                            results.hsa[ai, sim_idx], results.home_equity[ai, sim_idx],
+                            eff_ret_tax_rate, ltcg_rate)
+                    else:
+                        val = results.net_worth[ai, sim_idx]
                     if real_terms_t6:
                         val = val / (1 + INFLATION) ** (fire_age - start_age)
                     fire_nw.append(val)
@@ -854,7 +931,7 @@ with tab6:
                               annotation_text=f"P90: ${p90:,.0f}", annotation_position="top")
 
             fig.update_layout(
-                xaxis_title=f"Net Worth at FIRE {'(today\'s $)' if real_terms_t6 else '(nominal)'} — P1-P99 shown",
+                xaxis_title=f"Net Worth at FIRE {'(today\'s $)' if real_terms_t6 else '(nominal)'}{'· after-tax' if tax_adjust else ''} — P1-P99 shown",
                 xaxis=dict(tickformat='$,.0f'),
                 yaxis_title="Count",
                 height=500
@@ -1039,9 +1116,17 @@ with tab6:
 with tab3:
     st.subheader("Account Composition Over Time (Median)")
 
+    if tax_adjust:
+        st.caption(f"After-tax values: 401k discounted at {eff_ret_tax_rate:.0%} effective rate · Taxable gains at {ltcg_rate:.0%} LTCG · Roth/HSA shown at full value")
+
     ages = results.ages
-    taxable_med = np.median(results.taxable, axis=1)
-    t401k_med = np.median(results.t401k, axis=1)
+    if tax_adjust:
+        gains_med = np.maximum(results.taxable - results.taxable_basis, 0)
+        taxable_med = np.median(results.taxable - gains_med * ltcg_rate, axis=1)
+        t401k_med   = np.median(results.t401k * (1 - eff_ret_tax_rate), axis=1)
+    else:
+        taxable_med = np.median(results.taxable, axis=1)
+        t401k_med   = np.median(results.t401k, axis=1)
     roth_med = np.median(results.roth, axis=1)
     hsa_med = np.median(results.hsa, axis=1)
     home_med = np.median(results.home_equity, axis=1)
@@ -1049,11 +1134,11 @@ with tab3:
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
-        x=ages, y=taxable_med, name='Taxable',
+        x=ages, y=taxable_med, name='Taxable' + (' (after LTCG)' if tax_adjust else ''),
         mode='lines', stackgroup='one', fillcolor='rgba(99, 110, 250, 0.7)'
     ))
     fig.add_trace(go.Scatter(
-        x=ages, y=t401k_med, name='401(k)',
+        x=ages, y=t401k_med, name='401(k)' + (f' (after {eff_ret_tax_rate:.0%} tax)' if tax_adjust else ''),
         mode='lines', stackgroup='one', fillcolor='rgba(239, 85, 59, 0.7)'
     ))
     fig.add_trace(go.Scatter(

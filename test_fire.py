@@ -693,19 +693,20 @@ class TestWithdrawalTaxCorrectness:
                 f"Brokerage-only effective rate should be low: {eff_rate:.1%}"
 
     def test_roth_only_has_zero_withdrawal_tax(self):
-        """Roth-only retirees should pay no withdrawal tax."""
+        """Roth-only retirees should pay no withdrawal tax after 59.5."""
         r = _run(
             seeds=SeedAmounts(roth=2_000_000),
             use_401k=False, use_hsa=False,
             fire_horizon=40, n=500, seed=42,
         )
-        # After retirement, taxes should be near zero (only from working years)
-        age_50_idx = 50 - r.ages[0]
-        retired_mask = r.fired_status[age_50_idx]
+        # At age 62, Roth withdrawals (contributions + earnings) are fully tax-free.
+        # Before 60, earnings would be penalized — that's correct behavior, so test post-60.
+        age_62_idx = 62 - r.ages[0]
+        retired_mask = r.fired_status[age_62_idx]
         if retired_mask.sum() < 10:
             pytest.skip("Not enough retirees")
-        taxes_50 = np.median(r.taxes[age_50_idx, retired_mask])
-        assert taxes_50 < 1000, f"Roth retirement taxes should be ~0: got {taxes_50:,.0f}"
+        taxes_62 = np.median(r.taxes[age_62_idx, retired_mask])
+        assert taxes_62 < 1000, f"Roth retirement taxes after 60 should be ~0: got {taxes_62:,.0f}"
 
     def test_401k_withdrawal_has_income_tax(self):
         """401k-only retirees should pay income tax on withdrawals."""

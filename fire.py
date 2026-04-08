@@ -381,6 +381,7 @@ class SimulationResults:
     savings_hsa: np.ndarray         # (N_YEARS, N) HSA contributions
     savings_taxable: np.ndarray     # (N_YEARS, N) taxable account contributions
     ss_income: np.ndarray           # (N_YEARS, N) Social Security income
+    taxable_basis: np.ndarray       # (N_YEARS, N) cost basis of taxable account (for LTCG tax calc)
     # FIRE number: required nest egg in today's dollars at the moment of FIRE
     fire_number: np.ndarray         # (N,) real-dollar FIRE target per simulation
     fire_spending: np.ndarray       # (N,) annual retirement spending in today's dollars at FIRE
@@ -660,7 +661,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
                    life_expectancy=None, current_age=None, fire_horizon=None,
                    hsa_annual_contrib=None, hsa_employer_contrib=0, rent_override=None,
                    lifestyle_creep_pct=0.025, use_401k=True, use_roth=True, use_hsa=True,
-                   use_mega_backdoor=False, swr_override=None):
+                   use_mega_backdoor=False, mega_backdoor_cap=None, swr_override=None):
     """
     seed_amounts: SeedAmounts dataclass or dict with dollar amounts per account, e.g.
         SeedAmounts(taxable=165000, t401k=75000, roth=45000, hsa=15000)
@@ -718,6 +719,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         traj_savings_hsa = np.zeros((n_years, N))
         traj_savings_taxable = np.zeros((n_years, N))
         traj_ss_income = np.zeros((n_years, N))
+        traj_taxable_basis = np.zeros((n_years, N))
 
     if seed_amounts is None:
         seed_amounts = SeedAmounts()
@@ -960,6 +962,8 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         # Post-tax (no deduction), but grows and withdraws tax-free as Roth.
         if use_mega_backdoor and use_401k:
             mega_room = np.maximum(FOUR01K_TOTAL_LIMIT * inf - a401 - employer_match, 0)
+            if mega_backdoor_cap is not None:
+                mega_room = np.minimum(mega_room, mega_backdoor_cap * inf)
             mega_contrib = np.where(wp, np.minimum(mega_room, np.maximum(net_inc - a401 - ar - ah, 0) * 0.5), 0)
         else:
             mega_contrib = np.zeros(N)
@@ -1056,11 +1060,19 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         hsa_bal -= d_hsa_medical
         rem -= d_hsa_medical
 
-        # 3. Roth — always tax-free
+        # 3. Roth — contributions always tax-free; earnings taxable + 10% penalty before age 60
+        roth_before_wd = roth.copy()
         d_roth = np.minimum(rem, np.maximum(roth, 0))
+        safe_roth = np.maximum(roth_before_wd, 1.0)
+        basis_ratio = np.where(roth_before_wd > 0, np.minimum(roth_basis, roth_before_wd) / safe_roth, 1.0)
+        roth_basis_withdrawn = d_roth * basis_ratio
+        roth_earnings_withdrawn = d_roth - roth_basis_withdrawn
         roth -= d_roth
-        roth_basis = np.minimum(roth_basis, roth)
+        roth_basis = np.maximum(np.minimum(roth_basis - roth_basis_withdrawn, roth), 0)
         rem -= d_roth
+        # Earnings before 59.5 (proxied as 60): 10% penalty + treated as ordinary income
+        roth_penalty = np.where(age < 60, roth_earnings_withdrawn * 0.10, 0)
+        roth_early_income = np.where(age < 60, roth_earnings_withdrawn, 0)
 
         # 4. HSA non-medical remainder
         d_hsa_nonmed = np.minimum(rem * 0.5, np.maximum(hsa_bal, 0))
@@ -1079,11 +1091,11 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         taxable_basis += extra_rmd
 
         # Retirement tax model:
-        # - ordinary income: 401k + non-medical HSA withdrawals + excess RMD cashouts
+        # - ordinary income: 401k + non-medical HSA withdrawals + excess RMD cashouts + Roth earnings before 60
         # - Social Security can become federally taxable based on provisional income
         # - current city configs do not tax SS in retirement, so state tax is applied
         #   only to ordinary retirement income
-        ordinary_ret_income = d_hsa_nonmed + d_401k + extra_rmd
+        ordinary_ret_income = d_hsa_nonmed + d_401k + extra_rmd + roth_early_income
         taxable_gains_income = realized_gains
         taxable_ss = calc_taxable_ss_benefits(ss_inc, ordinary_ret_income + taxable_gains_income, filing_status)
         federal_ret_tax = calc_taxes_vec(
@@ -1094,7 +1106,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
         state_ret_tax = np.maximum(0, ordinary_ret_income - state_ret_deduction * inf) * cfg.retirement_state_tax
 
         # Total tax drag from withdrawals (deducted from portfolio)
-        total_wd_tax = taxable_tax + hsa_penalty + federal_ret_tax + state_ret_tax + pen_401k
+        total_wd_tax = taxable_tax + hsa_penalty + federal_ret_tax + state_ret_tax + pen_401k + roth_penalty
         # Pay taxes from taxable first, then 401k
         tax_from_taxable = np.minimum(total_wd_tax, np.maximum(taxable, 0))
         taxable -= tax_from_taxable
@@ -1165,6 +1177,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             traj_savings_hsa[i] = ah
             traj_savings_taxable[i] = np.where(wp, net_inc - a401 - ar - ah - mega_contrib, 0)
             traj_ss_income[i] = ss_inc
+            traj_taxable_basis[i] = taxable_basis.copy()
 
         # Check for FIRE eligibility only during working years (up to FIRE_HORIZON)
         if 30 <= age <= fire_horizon:
@@ -1273,6 +1286,7 @@ def run_vectorized(starting_tc, city_name, n_sims, rng, seed_amounts=None, famil
             savings_hsa=traj_savings_hsa,
             savings_taxable=traj_savings_taxable,
             ss_income=traj_ss_income,
+            taxable_basis=traj_taxable_basis,
             fire_number=fire_number_arr,
             fire_spending=fire_spending_arr,
         )
