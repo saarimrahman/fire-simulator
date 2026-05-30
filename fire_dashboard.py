@@ -1500,6 +1500,18 @@ with tab8:
                 xanchor="center",
             )
 
+        # Spread label flush to the right edge
+        spread = max(vals) - min(vals)
+        spread_text = f"Δ {spread:.1f} yrs" if val_idx == 1 else f"Δ {spread:.1f} ppt"
+        fig.add_annotation(
+            x=1.01, xref="paper",
+            y=lever,
+            text=f"<b>{spread_text}</b>",
+            showarrow=False,
+            font=dict(size=11, color="#555555"),
+            xanchor="left",
+        )
+
     all_vals = [row[val_idx] for _, scenarios in sorted_levers for row in scenarios]
     x_pad = max(1, (max(all_vals) - min(all_vals)) * 0.08)
 
@@ -1523,7 +1535,7 @@ with tab8:
             showgrid=False,
         ),
         height=max(420, len(sorted_levers) * 90),
-        margin=dict(l=120, r=40, t=40, b=60),
+        margin=dict(l=120, r=110, t=40, b=60),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True)
