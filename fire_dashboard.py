@@ -158,11 +158,11 @@ with st.sidebar:
         mega_backdoor_cap = None
         if use_mega_backdoor:
             _mbc_default = int(_qp("mbc", 0))
-            _mbc_val = st.number_input(
-                "Mega Backdoor cap ($/yr, 0 = max room)",
+            _mbc_val = st.slider(
+                "Mega Backdoor Cap ($/yr)",
                 min_value=0, max_value=46000, value=_mbc_default, step=1000,
-                format="%d",
-                help="Cap your annual after-tax 401k contribution. 0 means use all available room (~$34–46k depending on match). Set lower if cash flow is tight."
+                format="$%d",
+                help="Cap your annual after-tax 401k contribution. $0 = no cap (use all available room, ~$34–46k depending on match). Set lower if cash flow is tight."
             )
             mega_backdoor_cap = int(_mbc_val) if _mbc_val > 0 else None
         use_roth = st.toggle("Roth IRA", value=bool(_qp("use_roth", 0)), help="Annual direct Roth IRA contributions, with MAGI phaseout now modeled.")
@@ -188,7 +188,7 @@ with st.sidebar:
     with st.expander("Family", expanded=False):
         marriage_age = st.slider("Marriage Age", 25, 40, _qp("marriage", 29))
 
-        num_kids = st.radio("Number of Kids", [0, 1, 2], index=_qp("kids", 2), horizontal=True)
+        num_kids = st.radio("Number of Kids", [0, 1, 2, 3], index=_qp("kids", 2), horizontal=True)
         kid_ages = ()
         wedding_budget = st.number_input(
             "Wedding Budget ($)", min_value=0, max_value=500000, value=60000, step=5000,
@@ -198,9 +198,12 @@ with st.sidebar:
         if num_kids >= 1:
             kid1_age = st.slider("First Kid Born (Your Age)", 26, 45, 31)
             kid_ages = (kid1_age,)
-            if num_kids == 2:
+            if num_kids >= 2:
                 kid2_age = st.slider("Second Kid Born (Your Age)", kid1_age, 47, max(33, kid1_age + 2))
                 kid_ages = (kid1_age, kid2_age)
+                if num_kids == 3:
+                    kid3_age = st.slider("Third Kid Born (Your Age)", kid2_age, 49, max(35, kid2_age + 2))
+                    kid_ages = (kid1_age, kid2_age, kid3_age)
 
     with st.expander("Spouse Income", expanded=False):
         spouse_works = st.toggle("Spouse Works", value=bool(_qp("spouse", 1)))
@@ -1296,105 +1299,234 @@ with tab7:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Chart 8: Sensitivity Tornado
+# Chart 8: Ablation Analysis
 with tab8:
-    st.subheader("Sensitivity Analysis: Impact on Median FIRE Age")
-    st.caption("Shows how ±20% change in each parameter affects median FIRE age")
+    st.subheader("Ablation Analysis: What Moves the Needle?")
+    st.caption(
+        "Each row varies one lever while holding everything else at your current settings. "
+        "Switch metrics below — FIRE age and success rate tell different stories."
+    )
 
-    if median_fire_age is None:
-        st.warning("Not enough simulations reached FIRE to perform sensitivity analysis")
-    else:
-        @st.cache_data
-        def run_sensitivity(base_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
-                           marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-                           career_traj, soft_cap, emp_match_pct, emp_match_limit,
-                           ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming):
-            results = {}
-            base_params = {
-                'starting_tc': base_tc,
-                'seed_taxable': seed_taxable,
-                'spouse_salary': spouse_salary if spouse_works else 0,
-            }
+    ablation_metric = st.radio(
+        "Metric",
+        ["Median FIRE Age", "Success Rate (% not running out of money)"],
+        horizontal=True,
+    )
 
+    @st.cache_data
+    def run_ablation(base_tc, city, n_sims, start_age,
+                     seed_taxable, seed_401k, seed_roth, seed_hsa,
+                     marriage_age, kid_ages_base, spouse_works_base, spouse_salary_base,
+                     part_time_fraction,
+                     career_traj, soft_cap, emp_match_pct, emp_match_limit,
+                     use_401k, use_roth, use_hsa_base, use_mega_backdoor_base,
+                     hsa_annual_contrib, hsa_employer_contrib,
+                     ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming,
+                     fire_horizon, life_expectancy, swr_override, lifestyle_creep_pct):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _run_scenario(overrides):
+            _tc       = overrides.get('tc',                base_tc)
+            _city     = overrides.get('city',              city)
+            _seed_tax = overrides.get('seed_taxable',      seed_taxable)
+            _kid_ages = overrides.get('kid_ages',          kid_ages_base)
+            _sp_works = overrides.get('spouse_works',      spouse_works_base)
+            _sp_sal   = overrides.get('spouse_salary',     spouse_salary_base)
+            _use_hsa  = overrides.get('use_hsa',           use_hsa_base)
+            _use_mega = overrides.get('use_mega_backdoor', use_mega_backdoor_base)
+            _hsa_c    = overrides.get('hsa_annual_contrib', hsa_annual_contrib)
+
+            seed   = SeedAmounts(taxable=_seed_tax, t401k=seed_401k, roth=seed_roth, hsa=seed_hsa)
+            family = FamilyConfig(
+                marriage_age=marriage_age, kid_ages=_kid_ages,
+                spouse_works=_sp_works,
+                spouse_salary=_sp_sal if _sp_works else 0,
+                part_time_fraction=part_time_fraction,
+            )
+            career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
+                                  employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
             ss = SocialSecurityConfig(
                 enabled=ss_enabled, claiming_age=ss_claiming_age,
                 monthly_benefit_today=ss_monthly, spouse_monthly_benefit=ss_spouse_monthly,
-                spouse_claiming_age=ss_spouse_claiming
+                spouse_claiming_age=ss_spouse_claiming,
+            )
+            rng = np.random.default_rng(42)
+            fire_ages, failed, _ = run_vectorized(
+                _tc, _city, n_sims, rng,
+                seed_amounts=seed, family_config=family, career_config=career, ss_config=ss,
+                current_age=start_age, fire_horizon=fire_horizon, life_expectancy=life_expectancy,
+                use_401k=use_401k, use_roth=use_roth, use_hsa=_use_hsa,
+                use_mega_backdoor=_use_mega,
+                hsa_annual_contrib=_hsa_c if _use_hsa else None,
+                hsa_employer_contrib=hsa_employer_contrib,
+                swr_override=swr_override, lifestyle_creep_pct=lifestyle_creep_pct,
+                return_trajectories=False,
+            )
+            valid = fire_ages[(fire_ages < 99) & ~failed]
+            med_fire_age = float(np.median(valid)) if len(valid) > 0 else float(fire_horizon)
+            success_rate = float((~failed).mean()) * 100
+            return (med_fire_age, success_rate)
+
+        levers = {
+            "City": [
+                ("Sacramento",    {"city": "Sacramento"}),
+                ("San Francisco", {"city": "San Francisco"}),
+                ("NYC",           {"city": "New York City"}),
+            ],
+            "Kids": [
+                ("0 kids", {"kid_ages": ()}),
+                ("1 kid",  {"kid_ages": (31,)}),
+                ("2 kids", {"kid_ages": (31, 33)}),
+                ("3 kids", {"kid_ages": (31, 33, 35)}),
+            ],
+            "Spouse": [
+                ("No spouse",   {"spouse_works": False, "spouse_salary": 0}),
+                ("Spouse $80k", {"spouse_works": True,  "spouse_salary": 80000}),
+            ],
+            "Starting Savings": [
+                ("$0",    {"seed_taxable": 0}),
+                ("$100k", {"seed_taxable": 100_000}),
+                ("$250k", {"seed_taxable": 250_000}),
+                ("$500k", {"seed_taxable": 500_000}),
+            ],
+            "HSA": [
+                ("Off",      {"use_hsa": False}),
+                ("On (max)", {"use_hsa": True, "hsa_annual_contrib": HSA_FAMILY_LIMIT}),
+            ],
+            "Mega Backdoor": [
+                ("Off",      {"use_mega_backdoor": False}),
+                ("On (max)", {"use_mega_backdoor": True}),
+            ],
+        }
+
+        tasks = []
+        for lever, scenarios in levers.items():
+            for idx, (label, overrides) in enumerate(scenarios):
+                tasks.append((lever, idx, label, overrides))
+
+        results = {lever: [None] * len(scenarios) for lever, scenarios in levers.items()}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [(lever, idx, label, ex.submit(_run_scenario, overrides))
+                       for lever, idx, label, overrides in tasks]
+            for lever, idx, label, fut in futures:
+                results[lever][idx] = (label,) + fut.result()  # (label, fire_age, success_rate)
+
+        return results
+
+    ablation = run_ablation(
+        starting_tc, city, n_sims, start_age,
+        seed_taxable, seed_401k, seed_roth, seed_hsa,
+        marriage_age, kid_ages, spouse_works, spouse_salary,
+        part_time_fraction,
+        career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
+        use_401k, use_roth, use_hsa, use_mega_backdoor,
+        hsa_annual_contrib, hsa_employer_contrib,
+        ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming,
+        fire_horizon, life_expectancy, swr_override, lifestyle_creep_pct,
+    )
+
+    # Pick which column index to plot: 1 = fire_age, 2 = success_rate
+    val_idx = 1 if ablation_metric == "Median FIRE Age" else 2
+    higher_is_better = (val_idx == 2)  # success rate: higher = better; fire age: lower = better
+
+    def _gradient_color(score):
+        """score 0.0 = worst (red) → 1.0 = best (green), via orange at 0.5."""
+        r1, g1, b1 = 0xEF, 0x55, 0x3B  # red
+        r2, g2, b2 = 0xFF, 0xAA, 0x00  # orange (midpoint)
+        r3, g3, b3 = 0x00, 0xCC, 0x96  # green
+        if score <= 0.5:
+            t = score * 2
+            r, g, b = int(r1 + (r2 - r1) * t), int(g1 + (g2 - g1) * t), int(b1 + (b2 - b1) * t)
+        else:
+            t = (score - 0.5) * 2
+            r, g, b = int(r2 + (r3 - r2) * t), int(g2 + (g3 - g2) * t), int(b2 + (b3 - b2) * t)
+        return f"#{r:02X}{g:02X}{b:02X}"
+
+    def _row_colors(vals, higher_is_better):
+        lo, hi = min(vals), max(vals)
+        if hi == lo:
+            return ["#AAAAAA"] * len(vals)
+        scores = [(v - lo) / (hi - lo) for v in vals]
+        if not higher_is_better:
+            scores = [1 - s for s in scores]
+        return [_gradient_color(s) for s in scores]
+
+    # Sort by spread on the selected metric (most impactful first)
+    sorted_levers = sorted(
+        ablation.items(),
+        key=lambda kv: max(row[val_idx] for row in kv[1]) - min(row[val_idx] for row in kv[1]),
+        reverse=True,
+    )
+
+    fig = go.Figure()
+    lever_names = [lever for lever, _ in sorted_levers]
+
+    for lever, scenarios in sorted_levers:
+        vals   = [row[val_idx] for row in scenarios]
+        labels = [row[0]       for row in scenarios]
+        colors = _row_colors(vals, higher_is_better)
+
+        fig.add_trace(go.Scatter(
+            x=[min(vals), max(vals)],
+            y=[lever, lever],
+            mode="lines",
+            line=dict(color="#DDDDDD", width=2),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=vals,
+            y=[lever] * len(vals),
+            mode="markers",
+            marker=dict(
+                size=14,
+                color=colors,
+                line=dict(color="white", width=1.5),
+            ),
+            text=labels,
+            customdata=vals,
+            hovertemplate="%{text}: %{customdata:.1f}<extra>" + lever + "</extra>",
+            showlegend=False,
+        ))
+
+        for i, (row, val) in enumerate(zip(scenarios, vals)):
+            fig.add_annotation(
+                x=val, y=lever,
+                text=row[0],
+                showarrow=False,
+                yshift=18 if i % 2 == 0 else -18,
+                font=dict(size=10, color=colors[i]),
+                xanchor="center",
             )
 
-            for param, base_val in base_params.items():
-                if base_val == 0:
-                    continue
+    all_vals = [row[val_idx] for _, scenarios in sorted_levers for row in scenarios]
+    x_pad = max(1, (max(all_vals) - min(all_vals)) * 0.08)
 
-                low_val = int(base_val * 0.8)
-                high_val = int(base_val * 1.2)
+    if ablation_metric == "Median FIRE Age":
+        x_title = "Median FIRE Age"
+        x_range = [min(all_vals) - x_pad, max(all_vals) + x_pad]
+    else:
+        x_title = "Success Rate (%)"
+        x_range = [max(0, min(all_vals) - x_pad), min(100, max(all_vals) + x_pad)]
 
-                ages_list = []
-                for val in [low_val, high_val]:
-                    seed = SeedAmounts(
-                        taxable=val if param == 'seed_taxable' else seed_taxable,
-                        t401k=seed_401k, roth=seed_roth, hsa=seed_hsa
-                    )
-                    family = FamilyConfig(
-                        marriage_age=marriage_age, kid_ages=kid_ages, spouse_works=spouse_works,
-                        spouse_salary=val if param == 'spouse_salary' else spouse_salary,
-                        part_time_fraction=part_time_fraction
-                    )
-                    career = CareerConfig(soft_cap=soft_cap, trajectory=career_traj,
-                                         employer_match_pct=emp_match_pct, employer_match_limit=emp_match_limit)
-                    tc = val if param == 'starting_tc' else base_tc
-                    rng = np.random.default_rng(42)
-                    fire_ages, _, _ = run_vectorized(tc, city, n_sims, rng, seed_amounts=seed,
-                                              family_config=family, career_config=career,
-                                              ss_config=ss, return_trajectories=False)
-                    valid = fire_ages[fire_ages < 99]
-                    ages_list.append(np.median(valid) if len(valid) > 0 else 99)
-
-                results[param] = (ages_list[0], ages_list[1])
-
-            return results
-
-        sensitivity = run_sensitivity(
-            starting_tc, city, n_sims, seed_taxable, seed_401k, seed_roth, seed_hsa,
-            marriage_age, kid_ages, spouse_works, spouse_salary, part_time_fraction,
-            career_trajectory, tc_soft_cap, employer_match_pct, employer_match_limit,
-            ss_enabled, ss_claiming_age, ss_monthly, ss_spouse_monthly, ss_spouse_claiming
-        )
-
-        params = []
-        low_deltas = []
-        high_deltas = []
-
-        for param, (low_age, high_age) in sensitivity.items():
-            readable = {
-                'starting_tc': 'Total Compensation',
-                'seed_taxable': 'Starting Taxable',
-                'spouse_salary': 'Spouse Salary'
-            }.get(param, param)
-
-            params.append(readable)
-            low_deltas.append(low_age - median_fire_age)  # -20% param
-            high_deltas.append(high_age - median_fire_age)  # +20% param
-
-        fig = go.Figure()
-
-        fig.add_trace(go.Bar(
-            y=params, x=low_deltas,
-            orientation='h', name='-20%',
-            marker_color='#EF553B'
-        ))
-        fig.add_trace(go.Bar(
-            y=params, x=high_deltas,
-            orientation='h', name='+20%',
-            marker_color='#00CC96'
-        ))
-
-        fig.update_layout(
-            xaxis_title="Change in Median FIRE Age (years)",
-            barmode='group',
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        xaxis=dict(
+            title=x_title,
+            range=x_range,
+            showgrid=True,
+            gridcolor="#EEEEEE",
+        ),
+        yaxis=dict(
+            categoryorder="array",
+            categoryarray=lever_names[::-1],
+            showgrid=False,
+        ),
+        height=max(420, len(sorted_levers) * 90),
+        margin=dict(l=120, r=40, t=40, b=60),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # =============================================================================
 # DATA TABLE
